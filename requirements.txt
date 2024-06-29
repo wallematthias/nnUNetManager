@@ -1,0 +1,12 @@
+torch
+nnunetv2
+batchgenerators
+numpy
+SimpleITK
+argparse
+scikit-image
+matplotlib
+glob2
+acvl-utils
+pandas
+pytest>=6.0

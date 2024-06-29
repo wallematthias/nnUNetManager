@@ -1,0 +1,4 @@
+# Ignore everything in the models directory
+/models/*
+/cmd/*
+/helpers/*

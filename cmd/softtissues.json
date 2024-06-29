@@ -1,0 +1,62 @@
+{
+    "Dataset293_TotalSegmentator_part3_cardiac_1559subj": {
+        "order": "1",
+        "trainer": "nnUNetTrainerNoMirroring",
+        "fold": "0",
+        "checkpoint": "checkpoint_final",
+        "config": "3d_fullres",
+        "labels": {
+            "heart": 1,
+            "aorta": 2,
+            "pulmonary_vein": 3,
+            "brachiocephalic_trunk": 4,
+            "subclavian_artery_right": 5,
+            "subclavian_artery_left": 6,
+            "common_carotid_artery_right": 7,
+            "common_carotid_artery_left": 8,
+            "brachiocephalic_vein_left": 9,
+            "brachiocephalic_vein_right": 10,
+            "atrial_appendage_left": 11,
+            "superior_vena_cava": 12,
+            "inferior_vena_cava": 13,
+            "portal_vein_and_splenic_vein": 14,
+            "iliac_artery_left": 15,
+            "iliac_artery_right": 16,
+            "iliac_vena_left": 17,
+            "iliac_vena_right": 18
+        }
+    },
+    "Dataset294_TotalSegmentator_part4_muscles_1559subj": {
+        "order": "2",
+        "trainer": "nnUNetTrainerNoMirroring",
+        "fold": "0",
+        "checkpoint": "checkpoint_final",
+        "config": "3d_fullres",
+        "labels": {
+            "gluteus_maximus_left": 19,
+            "gluteus_maximus_right": 20,
+            "gluteus_medius_left": 21,
+            "gluteus_medius_right": 22,
+            "gluteus_minimus_left": 23,
+            "gluteus_minimus_right": 24,
+            "autochthon_left": 25,
+            "autochthon_right": 26,
+            "iliopsoas_left": 27,
+            "iliopsoas_right": 28,
+            "brain": 29,
+            "skull": 30
+        }
+    },
+    "Dataset481_tissue_1559subj": {
+        "order": "3",
+        "trainer": "nnUNetTrainer",
+        "fold": "0",
+        "checkpoint": "checkpoint_final",
+        "config": "3d_fullres",
+        "labels": {
+            "subcutaneous_fat": 31,
+            "torso_fat": 32,
+            "skeletal_muscle": 33
+        }
+    }    
+}
