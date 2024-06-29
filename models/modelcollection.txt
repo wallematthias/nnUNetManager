@@ -1,0 +1,55 @@
+# Link collection for TotalSegmentator Models
+
+# Dataset 291
+291, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset291_TotalSegmentator_part1_organs_1559subj.zip
+
+# Dataset 292
+292, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset292_TotalSegmentator_part2_vertebrae_1532subj.zip
+
+# Dataset 293
+293, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset293_TotalSegmentator_part3_cardiac_1559subj.zip
+
+# Dataset 294
+294, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset294_TotalSegmentator_part4_muscles_1559subj.zip
+
+# Dataset 295
+295, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset295_TotalSegmentator_part5_ribs_1559subj.zip
+
+# Dataset 297
+297, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset297_TotalSegmentator_total_3mm_1559subj.zip
+
+# Dataset 298
+298, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset298_TotalSegmentator_total_6mm_1559subj.zip
+
+# Dataset 299
+299, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset299_body_1559subj.zip
+
+# Dataset 300
+300, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip
+
+# Dataset 730
+730, https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset730_TotalSegmentatorMRI_part1_organs_495subj.zip
+
+# Dataset 731
+731, https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset731_TotalSegmentatorMRI_part2_muscles_495subj.zip
+
+# Dataset 732
+732, https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset732_TotalSegmentatorMRI_total_3mm_495subj.zip
+
+# Dataset 733
+733, https://github.com/wasserth/TotalSegmentator/releases/download/v2.2.0-weights/Dataset733_TotalSegmentatorMRI_total_6mm_495subj.zip
+
+# Dataset 258
+258, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset258_lung_vessels_248subj.zip
+
+# Dataset 150
+150, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset150_icb_v0.zip
+
+# Dataset 260
+260, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset260_hip_implant_71subj.zip
+
+# Dataset 315
+315, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset315_thoraxCT.zip
+
+# Dataset 503
+503, https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset503_cardiac_motion.zip
