@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'nnunetmgr=nnUNetManager.nnunetmgr:main',
+            'nnunetmgr-download=nnUNetManager.nnunetmgr:download_models_from_file',
         ],
     },
     classifiers=[

@@ -472,7 +472,8 @@ def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[
 
     if len(model_paths)==0:
         logging.info(f'Model directory does not exist. Downloading the model...')
-        download_model(home)  # You need to implement this function to handle the download
+        url = "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip"
+        download_model(home, url)  # You need to implement this function to handle the download
         model_paths = glob(os.path.join(home, model_dir))
 
     logging.info(f'Cropping to trunk using {model_paths[0]}')
@@ -489,7 +490,7 @@ def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[
     logging.debug(f"Cropped to size: {roi_size}, start: {roi_start}")
     return roi_size, roi_start
 
-def download_model(model_path: str):
+def download_model(model_path: str, url: str):
     """
     Download a zip file from a URL, extract its contents into the specified path,
     and delete the zip file after extraction.
@@ -498,7 +499,6 @@ def download_model(model_path: str):
         model_path (str): The path where the model should be extracted.
     """
     # URL of the zip file to download
-    url = "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip"
     
     # Create the folder if it doesn't exist
     os.makedirs(model_path, exist_ok=True)
@@ -525,7 +525,34 @@ def download_model(model_path: str):
     os.remove(filename)
     print(f"Deleted {filename}")
     
-
+def download_models_from_file():
+    # Get the directory path where the file is located
+    configure_environment_variables()
+    models_dir = os.getenv('NNUNET_MODELS_DIR')
+    if not models_dir:
+        print("Error: NNUNET_MODELS_DIR environment variable is not set.")
+        return
+    
+    # Construct the file path
+    file_path = os.path.join(models_dir, 'modelcollection.txt')
+    
+    # Check if the file exists
+    if not os.path.exists(file_path):
+        print(f"Error: File {file_path} not found.")
+        return
+    
+    # Open and read each line in the file
+    with open(file_path, 'r') as file:
+        lines = file.readlines()
+        
+        # Process each line (assuming each line contains a URL)
+        for line in lines:
+            line = line.strip()  # Remove leading/trailing whitespace
+            if line and not line.startswith('#'):  # Skip comments and empty lines
+                parts = line.split(',', 1)
+                if len(parts) == 2:
+                    dataset_id, url = parts
+                    download_model(models_dir, url.strip())
 
 def fill_cropped_image_into_original(cropped_image: sitk.Image, original_image: sitk.Image, roi_size: Tuple[int, int, int], roi_start: Tuple[int, int, int]) -> sitk.Image:
     """
@@ -787,6 +814,8 @@ def main():
     parser.add_argument('--trunk', action='store_true', help='Enable trunk cropping mode')
     parser.add_argument('--preserve', action='store_true', help='Enable no reorienting of images')
 
+
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -798,6 +827,8 @@ def main():
     logging_level = logging.getLevelName(logger.getEffectiveLevel())
     logging.info(f"Current logging level: {logging_level}")
     
+
+
     models, df = load_models_from_json(args.cmd)
     
     name = None
