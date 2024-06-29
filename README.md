@@ -3,14 +3,17 @@
 ![Python Package](https://github.com/wallematthias/nnUNetManager/actions/workflows/python-package.yml/badge.svg) ![PyPi](https://github.com/wallematthias/nnUNetManager/actions/workflows/python-publish.yml/badge.svg)
 
 
-nnUNetManager is a command-line tool designed to manage and execute nnUNet models for medical image segmentation tasks. It simplifies the execution of predefined commands stored in JSON files, facilitating complex segmentation workflows.
+nnUNetManager is a command-line tool designed to manage and execute nnUNet models for medical image segmentation tasks. It simplifies the execution of predefined commands stored in JSON files, facilitating complex segmentation workflows consisting out of several nnUNet models. Some functionality was inspired by [Totalsegmentator](https://github.com/wasserth/TotalSegmentator), however with a customizable workflow to add new models. 
+
+All credit to the original developers of [nnUNet](https://github.com/MIC-DKFZ/nnUNet) and [Totalsegmentator](https://github.com/wasserth/TotalSegmentator)
 
 ## Installation
 
 To install nnUNetManager, use pip:
-
+```
+git clone https://github.com/wallematthias/nnUNetManager.git
 pip install -e .
-
+```
 ## Usage
 
 nnUNetManager operates through command-line commands defined in JSON files located in the commands directory. Each command specifies a pretrained model and its configurations for segmentation tasks.
