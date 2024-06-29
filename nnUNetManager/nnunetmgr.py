@@ -20,6 +20,7 @@ import nibabel as nib
 import numpy as np
 import SimpleITK as sitk
 from nibabel.orientations import io_orientation, inv_ornt_aff, apply_orientation
+import requests
 
 
 
@@ -465,12 +466,12 @@ def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[
         tuple: ROI size and start index for cropping.
     """
     home = os.getenv('NNUNET_MODELS_DIR')
-    model_dir = 'Dataset300_TotalSegmentator_body_6mm_1559subj/nnUNetTrainer__nnUNetPlans__3d_fullres'
-    model_path = os.path.join(home, model_dir)
+    model_dir = 'Dataset300*/nnUNetTrainer__nnUNetPlans__3d_fullres'
+    model_path = glob(os.path.join(home, model_dir))[0]
 
     if not os.path.exists(model_path):
         logging.info(f'Model directory {model_path} does not exist. Downloading the model...')
-        download_model(model_path)  # You need to implement this function to handle the download
+        download_model(home)  # You need to implement this function to handle the download
 
     logging.info(f'Cropping to trunk using {model_path}')
     trunc = predict_with_nnunet([image], model_path, checkpoint_name='checkpoint_final.pth', fold=0)
@@ -493,7 +494,25 @@ def download_model(model_path: str):
     Parameters:
         model_path (str): The path where the model should be downloaded.
     """
-    raise FileNotFoundError(f'Model directory {model_path} does not exist. Please download the model manually and place it in the specified directory.')
+
+    # URL of the file to download
+    url = "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip"
+    
+    # Create the folder if it doesn't exist
+    os.makedirs(model_path, exist_ok=True)
+    
+    # Filename from the URL
+    filename = os.path.join(model_path, url.split("/")[-1])
+    
+    # Download the file from the URL
+    response = requests.get(url)
+    if response.status_code == 200:
+        with open(filename, 'wb') as f:
+            f.write(response.content)
+        print(f"Downloaded {filename}")
+    else:
+        print(f"Failed to download from {url}. Status code: {response.status_code}")
+    
 
 
 def fill_cropped_image_into_original(cropped_image: sitk.Image, original_image: sitk.Image, roi_size: Tuple[int, int, int], roi_start: Tuple[int, int, int]) -> sitk.Image:
