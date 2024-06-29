@@ -21,6 +21,7 @@ import numpy as np
 import SimpleITK as sitk
 from nibabel.orientations import io_orientation, inv_ornt_aff, apply_orientation
 import requests
+import zipfile
 
 
 
@@ -467,14 +468,15 @@ def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[
     """
     home = os.getenv('NNUNET_MODELS_DIR')
     model_dir = 'Dataset300*/nnUNetTrainer__nnUNetPlans__3d_fullres'
-    model_path = glob(os.path.join(home, model_dir))[0]
+    model_paths = glob(os.path.join(home, model_dir))
 
-    if not os.path.exists(model_path):
-        logging.info(f'Model directory {model_path} does not exist. Downloading the model...')
+    if len(model_paths)==0:
+        logging.info(f'Model directory does not exist. Downloading the model...')
         download_model(home)  # You need to implement this function to handle the download
+        model_paths = glob(os.path.join(home, model_dir))
 
-    logging.info(f'Cropping to trunk using {model_path}')
-    trunc = predict_with_nnunet([image], model_path, checkpoint_name='checkpoint_final.pth', fold=0)
+    logging.info(f'Cropping to trunk using {model_paths[0]}')
+    trunc = predict_with_nnunet([image], model_paths[0], checkpoint_name='checkpoint_final.pth', fold=0)
 
     binary_seg = sitk.Cast(trunc == 1, sitk.sitkUInt8)
 
@@ -489,13 +491,13 @@ def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[
 
 def download_model(model_path: str):
     """
-    Raise an error to indicate the model needs to be downloaded manually.
-    
-    Parameters:
-        model_path (str): The path where the model should be downloaded.
-    """
+    Download a zip file from a URL, extract its contents into the specified path,
+    and delete the zip file after extraction.
 
-    # URL of the file to download
+    Parameters:
+        model_path (str): The path where the model should be extracted.
+    """
+    # URL of the zip file to download
     url = "https://github.com/wasserth/TotalSegmentator/releases/download/v2.0.0-weights/Dataset300_body_6mm_1559subj.zip"
     
     # Create the folder if it doesn't exist
@@ -504,7 +506,7 @@ def download_model(model_path: str):
     # Filename from the URL
     filename = os.path.join(model_path, url.split("/")[-1])
     
-    # Download the file from the URL
+    # Download the zip file
     response = requests.get(url)
     if response.status_code == 200:
         with open(filename, 'wb') as f:
@@ -512,6 +514,16 @@ def download_model(model_path: str):
         print(f"Downloaded {filename}")
     else:
         print(f"Failed to download from {url}. Status code: {response.status_code}")
+        return
+    
+    # Unzip the file
+    with zipfile.ZipFile(filename, 'r') as zip_ref:
+        zip_ref.extractall(model_path)
+        print(f"Extracted contents to {model_path}")
+    
+    # Delete the zip file after extraction
+    os.remove(filename)
+    print(f"Deleted {filename}")
     
 
 
@@ -775,8 +787,6 @@ def main():
     parser.add_argument('--trunk', action='store_true', help='Enable trunk cropping mode')
     parser.add_argument('--preserve', action='store_true', help='Enable no reorienting of images')
 
-
-
     args = parser.parse_args()
 
     if args.verbose:
@@ -788,8 +798,6 @@ def main():
     logging_level = logging.getLevelName(logger.getEffectiveLevel())
     logging.info(f"Current logging level: {logging_level}")
     
-
-
     models, df = load_models_from_json(args.cmd)
     
     name = None
