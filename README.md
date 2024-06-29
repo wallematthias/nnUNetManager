@@ -18,7 +18,7 @@ nnUNetManager operates through command-line commands defined in JSON files locat
 ### Example Command File
 
 Here's a generic example of a command file (commands/example_command.json):
-
+```
 {
     "dataset1_model": {
         "order": "1",
@@ -45,7 +45,7 @@ Here's a generic example of a command file (commands/example_command.json):
         }
     }
 }
-
+```
 ### Command Line Options
 
 nnUNetManager supports several command line options:
@@ -63,6 +63,7 @@ nnUNetManager supports several command line options:
 
 Ensure your models are organized in the standard output structure from nnUNet:
 
+```
 models/
 |-- Dataset00X_XXXX/
     |-- dataset_fingerprint.json
@@ -70,6 +71,7 @@ models/
     |-- plans.json
     |-- fold_X/
         |-- checkpoint_final.pth
+```
 
 ## License
 
