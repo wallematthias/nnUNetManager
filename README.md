@@ -1,4 +1,3 @@
 # nnUNetManager
 
-
-![Tests](https://img.shields.io/github/workflow/status/wallematthias/nnUNetManager/Run%20Tests
+![example workflow](https://github.com/github/docs/actions/workflows/python-package.yml/badge.svg)
