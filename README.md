@@ -70,6 +70,8 @@ nnUNetManager supports several command line options:
 - --split: Enables splitting mode.
 - --trunk: Enables trunk cropping mode (requires downloading the pretrained dataset).
 - --preserve: Disables reorienting of images.
+- --cc: Only keeps the largest connected component of each label
+- --repair: Attempts to reassign unconnected components to their neighbours. 
 
 ## Folder Structure
 

@@ -2,31 +2,126 @@ import os
 import json
 import logging
 import argparse
+import random
+import string
+import zipfile
+import requests
+
 import torch
-import SimpleITK as sitk
 import numpy as np
 import pandas as pd
-from typing import List, Tuple, Union, Optional
+import nibabel as nib
+import SimpleITK as sitk
+import matplotlib.pyplot as plt
 
+from glob import glob
+from typing import List, Tuple, Union, Optional
+from skimage.measure import label
+from scipy.ndimage import binary_dilation
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from acvl_utils.morphology.morphology_helper import remove_all_but_largest_component
 from batchgenerators.utilities.file_and_folder_operations import join
-from skimage.measure import label
-from matplotlib import pyplot as plt
-from glob import glob
-import random
-import string
-import nibabel as nib
-import numpy as np
-import SimpleITK as sitk
 from nibabel.orientations import io_orientation, inv_ornt_aff, apply_orientation
-import requests
-import zipfile
-
 
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def configure_environment_variables():
+    """
+    Set environment variables required for the nnU-Net models.
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    nnunet_models_dir = os.path.join(base_dir, '../models')
+    nnunet_cmd_dir = os.path.join(base_dir, '../cmd')
+    os.environ['NNUNET_MODELS_DIR'] = nnunet_models_dir
+    os.environ['NNUNET_CMD_DIR'] = nnunet_cmd_dir
+
+    logging.info(f"NNUNET_MODELS_DIR is set to {nnunet_models_dir}")
+    logging.info(f"NNUNET_CMD_DIR is set to {nnunet_cmd_dir}")
+
+
+def get_device() -> str:
+    """Determine and return the available device for computation."""
+    return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+def read_image(file_path, reorient=True):
+    """
+    Read a NIfTI image, optionally reorient to RAS using nibabel, and convert it to a SimpleITK image.
+    
+    Parameters:
+    file_path (str): Path to the NIfTI image file.
+    reorient (bool): Whether to reorient the image to RAS. Default is True.
+    
+    Returns:
+    SimpleITK.Image: The reoriented image as a SimpleITK image.
+    dict: Properties including original and reoriented affines.
+    """
+    # Load the image using nibabel
+    nib_image = nib.load(file_path)
+    
+    # Ensure the image is 3D
+    assert nib_image.ndim == 3, 'Only 3D images are supported.'
+    
+    # Get the original affine
+    original_affine = nib_image.affine
+
+    if reorient:
+        # Reorient the image to RAS
+        orig_ornt = io_orientation(original_affine)
+        target_ornt = [[0, 1], [1, 1], [2, 1]]
+        transform = nib.orientations.ornt_transform(orig_ornt, target_ornt)
+        reoriented_data = apply_orientation(nib_image.get_fdata(), transform)
+        
+        # Compute the reoriented affine
+        reoriented_affine = np.dot(original_affine, inv_ornt_aff(transform, nib_image.shape))
+    else:
+        reoriented_data = nib_image.get_fdata()
+        reoriented_affine = original_affine
+    
+    # Convert to SimpleITK image
+    sitk_image = sitk.GetImageFromArray(reoriented_data.transpose(2, 1, 0))
+    spacing = list(map(float, reversed(nib_image.header.get_zooms())))
+    sitk_image.SetSpacing(spacing)
+    sitk_image.SetOrigin(tuple(reoriented_affine[:3, 3]))
+    sitk_image.SetDirection(reoriented_affine[:3, :3].flatten().tolist())
+
+    properties = {
+        'original_affine': original_affine,
+        'reoriented_affine': reoriented_affine,
+        'reoriented': reorient
+    }
+    
+    return sitk_image, properties
+
+
+def write_image(sitk_image, file_path, properties):
+    """
+    Convert a SimpleITK image to a nibabel NIfTI image, optionally reorient back to original orientation, and save it.
+    
+    Parameters:
+    sitk_image (SimpleITK.Image): The SimpleITK image to be saved.
+    file_path (str): Path to save the NIfTI image file.
+    properties (dict): Properties including original and reoriented affines.
+    """
+    original_affine = properties['original_affine']
+    reoriented_affine = properties['reoriented_affine']
+    reoriented = properties['reoriented']
+
+    data = sitk.GetArrayFromImage(sitk_image).transpose(2, 1, 0)
+    if reoriented:
+        orig_ornt = io_orientation(original_affine)
+        target_ornt = io_orientation(reoriented_affine)
+        transform = nib.orientations.ornt_transform(target_ornt, orig_ornt)
+        restored_data = apply_orientation(data, transform)
+    else:
+        restored_data = data
+
+    nifti_image = nib.Nifti1Image(restored_data, original_affine)
+    nib.save(nifti_image, file_path)
+
 
 def extract_spacing_from_plans(file_path: str) -> Union[List[float], str]:
     """
@@ -52,6 +147,7 @@ def extract_spacing_from_plans(file_path: str) -> Union[List[float], str]:
         logging.error(error_msg)
         return error_msg
 
+
 def fetch_label_value_from_json(model_path: str, labelname: str) -> int:
     """
     Retrieve the label value for a given label name from a JSON file.
@@ -67,6 +163,7 @@ def fetch_label_value_from_json(model_path: str, labelname: str) -> int:
     with open(file_path, 'r') as file:
         data = json.load(file)
     return data['labels'].get(labelname, -1)
+
 
 def fetch_orientation_from_json(model_path: str) -> bool:
     """
@@ -103,6 +200,7 @@ def fetch_label_name_from_json(model_path: str, value: int) -> str:
         data = json.load(file)
     reverse_lookup = {v: k for k, v in data['labels'].items()}
     return reverse_lookup.get(value, "Unknown label")
+
 
 def load_models_from_json(json_file: str) -> Tuple[List[dict], pd.DataFrame]:
     """
@@ -162,11 +260,6 @@ def load_models_from_json(json_file: str) -> Tuple[List[dict], pd.DataFrame]:
 
     df = pd.DataFrame(records)
     return models, df
-
-def get_device() -> str:
-    """Determine and return the available device for computation."""
-    return 'cuda' if torch.cuda.is_available() else 'cpu'
-
 
 
 def load_images(images: List[sitk.Image]) -> Tuple[np.ndarray, dict]:
@@ -229,7 +322,7 @@ def rescale_itk_image(itk_image: sitk.Image, target_spacing: Tuple[float, float,
     resampler.SetSize(new_size)
     resampler.SetOutputSpacing(target_spacing)
     resampler.SetTransform(sitk.Transform())
-    resampler.SetInterpolator(sitk.sitkLinear) #sitkBSpline
+    resampler.SetInterpolator(sitk.sitkBSpline) #sitkBSpline
     resampler.SetOutputOrigin(itk_image.GetOrigin())
     resampler.SetOutputDirection(itk_image.GetDirection())
 
@@ -264,6 +357,7 @@ def split_itk_image(image: sitk.Image, margin: int = 20) -> List[sitk.Image]:
         part.SetDirection(image.GetDirection())
 
     return parts
+
 
 def stitch_itk_image(parts: List[sitk.Image], margin: int = 20) -> sitk.Image:
     """
@@ -301,6 +395,7 @@ def stitch_itk_image(parts: List[sitk.Image], margin: int = 20) -> sitk.Image:
 
     return stitched_image
 
+
 def extract_largest_connected_component(input_image: sitk.Image) -> sitk.Image:
     """
     Extract and return the largest connected component from the input SimpleITK image.
@@ -328,6 +423,196 @@ def extract_largest_connected_component(input_image: sitk.Image) -> sitk.Image:
 
     largest_component = sitk.BinaryThreshold(connected_components, lowerThreshold=largest_label, upperThreshold=largest_label, insideValue=1, outsideValue=0)
     return largest_component
+
+
+def remove_small_components(input_image: sitk.Image, min_size: int) -> sitk.Image:
+    """
+    Remove all components smaller than the given threshold from the input image.
+    
+    Parameters:
+        input_image (SimpleITK.Image): The input image.
+        min_size (int): The minimum size (in voxels) for a component to be kept.
+        
+    Returns:
+        SimpleITK.Image: The image with small components removed.
+    """
+    connected_component_filter = sitk.ConnectedComponentImageFilter()
+    connected_components = connected_component_filter.Execute(input_image)
+    
+    label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
+    label_shape_filter.Execute(connected_components)
+
+    labels = label_shape_filter.GetLabels()
+    output_image = sitk.Image(input_image.GetSize(), sitk.sitkUInt8)
+    output_image.CopyInformation(input_image)
+
+    for label in labels:
+        if label_shape_filter.GetNumberOfPixels(label) >= min_size:
+            component_mask = sitk.BinaryThreshold(connected_components, lowerThreshold=label, upperThreshold=label, insideValue=1, outsideValue=0)
+            output_image = output_image | component_mask
+    
+    return output_image
+
+def remove_small_components_multilabel(input_image: sitk.Image, min_size: int) -> sitk.Image:
+    """
+    Remove all components smaller than the given threshold from the input multi-label image.
+    
+    Parameters:
+        input_image (SimpleITK.Image): The input multi-label image.
+        min_size (int): The minimum size (in voxels) for a component to be kept.
+        
+    Returns:
+        SimpleITK.Image: The image with small components removed.
+    """
+    # Get unique labels in the image
+    unique_labels = np.unique(sitk.GetArrayViewFromImage(input_image))
+
+    # Create an empty output image
+    output_image = sitk.Image(input_image.GetSize(), input_image.GetPixelID())
+    output_image.CopyInformation(input_image)
+
+    for label in unique_labels:
+        if label == 0:
+            continue  # Skip background
+
+        # Create a binary image for the current label
+        binary_image = sitk.BinaryThreshold(input_image, lowerThreshold=float(label), upperThreshold=float(label), insideValue=int(1), outsideValue=int(0))
+        
+        # Remove small components in the binary image
+        filtered_binary_image = remove_small_components(binary_image, min_size)
+        
+        # Convert the filtered binary image back to the original label
+        filtered_label_image = sitk.BinaryThreshold(filtered_binary_image, lowerThreshold=float(1), upperThreshold=float(1), insideValue=int(label), outsideValue=int(0))
+        
+        # Cast to same type
+        filtered_label_image = sitk.Cast(filtered_label_image, output_image.GetPixelID())
+
+        # Combine the filtered label image with the output image
+        output_image = sitk.Add(output_image, filtered_label_image)
+
+    return output_image
+
+def repair_multilabel(segmentation_image: sitk.Image, min_size: int) -> sitk.Image:
+    """
+    Repair the remaining components in the segmentation image by first removing small components and then
+    assigning larger remaining components the label of their best-connected neighbor.
+
+    Parameters:
+        segmentation_image (SimpleITK.Image): The input segmentation image (multi-label).
+        min_size (int): The minimum size (in voxels) for a component to be kept.
+        
+    Returns:
+        sitk.Image: The repaired segmentation image.
+    """
+    segmentation_array = sitk.GetArrayFromImage(segmentation_image)
+    repaired_array = np.zeros_like(segmentation_array,dtype=int)
+    switching_label_tracker = np.zeros_like(segmentation_array,dtype=int)
+
+    unique_labels = np.unique(segmentation_array[segmentation_array>0])
+
+    for label in unique_labels:
+        label_mask = segmentation_array == label
+        # Remove small components and set largest CC as label
+        label_mask_image = sitk.GetImageFromArray(label_mask.astype(np.uint8))
+        label_mask_image.CopyInformation(segmentation_image)
+
+        largest_label_mask_image = extract_largest_connected_component(label_mask_image)
+        largest_label_mask_array = sitk.GetArrayFromImage(largest_label_mask_image).astype(bool)
+        repaired_array[largest_label_mask_array] = label
+
+        remaining_components_mask = (label_mask & ~largest_label_mask_array)
+        remaining_components_image = sitk.GetImageFromArray(remaining_components_mask.astype(int))
+
+        cleaned_label_mask_image = remove_small_components(remaining_components_image, min_size)
+        cleaned_label_mask_array = sitk.GetArrayFromImage(cleaned_label_mask_image).astype(bool)
+        
+        if np.any(cleaned_label_mask_array):
+            # Find connected components in the cleaned mask
+            cleaned_label_mask_image = sitk.GetImageFromArray(cleaned_label_mask_array.astype(np.uint8))
+            cleaned_label_mask_image.CopyInformation(segmentation_image)
+            connected_component_filter = sitk.ConnectedComponentImageFilter()
+            connected_components = connected_component_filter.Execute(cleaned_label_mask_image)
+            
+            label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
+            label_shape_filter.Execute(connected_components)
+            remaining_labels = label_shape_filter.GetLabels()
+            
+            for remaining_label in remaining_labels:
+                component_mask = sitk.BinaryThreshold(connected_components, lowerThreshold=remaining_label, upperThreshold=remaining_label, insideValue=1, outsideValue=0)
+                component_mask.CopyInformation(segmentation_image)
+                component_array = sitk.GetArrayFromImage(component_mask).astype(bool)
+                 
+                # Find the best connected neighbor for this component in the original image
+                dilated_mask = binary_dilation(component_array) & (component_array == 0)
+                neighbor_labels = segmentation_array[dilated_mask & (segmentation_array > 0)]
+                unique_neighbors, counts = np.unique(neighbor_labels, return_counts=True)
+
+                if len(unique_neighbors) > 0:
+                    best_neighbor_label = unique_neighbors[np.argmax(counts)]
+                    logging.debug(f'Label {label}: Repairing component #{remaining_label}, best neighbour: {best_neighbor_label}')
+                    repaired_array[component_array] = best_neighbor_label
+                    
+                    # This tracks which labels have been re-assigned. If a label is re-assigned multiple times a warning is raised
+                    # This typically means that there is some problem in the original labels. E.g. Missing, Split or Duplicate labels
+                    # Update the switching label tracker
+                    switching_label_tracker[component_array] += 1
+                    if np.any(switching_label_tracker[component_array] > 1):
+                        logging.warning(f'There seems to be a duplicate label/unconnected component for label: {label} that cannot be resolved')
+
+                else:
+                    repaired_array[component_array] = 0
+    
+    repaired_image = sitk.GetImageFromArray(repaired_array)
+    repaired_image.CopyInformation(segmentation_image)
+    
+    return repaired_image
+
+
+def extract_largest_connected_component_multilabel(input_image: sitk.Image) -> sitk.Image:
+    """
+    Extract and return the largest connected component for each label in the input SimpleITK image.
+    If the input image is empty, return the input image.
+    
+    Parameters:
+        input_image (SimpleITK.Image): The input image.
+        repair (bool): If True, assigns removed components to the label of their best-connected neighbor. If none, assigns 0.
+        
+    Returns:
+        SimpleITK.Image: Image containing only the largest connected component for each label.
+    """
+    # Create the output image
+    logging.info(f'Running largest connected component (and repair) analysis...')
+
+    output_image = sitk.Image(input_image.GetSize(), input_image.GetPixelID())
+    output_image.CopyInformation(input_image)
+
+    # Convert input image to numpy array for easier label-wise processing
+    input_array = sitk.GetArrayFromImage(input_image)
+    output_array = np.zeros_like(input_array)
+
+    # Process each label separately
+    unique_labels = np.unique(input_array)
+    if 0 in unique_labels:
+        unique_labels = unique_labels[unique_labels != 0]  # Exclude background label
+
+    for label in unique_labels:
+        logging.debug(f'Extracting single connected component for label {label}')
+        # Extract the current label's binary mask
+        label_mask = input_array == label
+        sitk_label_mask = sitk.GetImageFromArray(label_mask.astype(np.uint8))
+        sitk_label_mask.CopyInformation(input_image)
+        
+        # Apply largest connected component extraction
+        largest_component_mask = extract_largest_connected_component(sitk_label_mask)
+        largest_component_array = sitk.GetArrayFromImage(largest_component_mask).astype(bool)
+        
+        output_array[largest_component_array] = label
+    
+    output_image = sitk.GetImageFromArray(output_array)
+    output_image.CopyInformation(input_image)
+    
+    return output_image
+
 
 def perform_prediction(images: List[sitk.Image], path: str, trainer: str, config: str, checkpoint_name: str = 'checkpoint_final.pth', fold: int = 0, target_spacing: Optional[Tuple[float, float, float]] = None, force_split: bool = True) -> sitk.Image:
     """
@@ -387,6 +672,7 @@ def perform_prediction(images: List[sitk.Image], path: str, trainer: str, config
     logging.debug("Resampling prediction to original image dimensions.")
     return resampler.Execute(combined_prediction)
 
+
 def save_prediction_slice(image: sitk.Image):
     """
     Save the middle slice (along the z-axis) of the given 3D image as a PNG file
@@ -412,6 +698,7 @@ def save_prediction_slice(image: sitk.Image):
     
     logging.info(f"Saved prediction slice as {random_filename}")
 
+
 def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_name: str = 'checkpoint_final.pth', fold: int = 0) -> sitk.Image:
     """
     Predict output using a nnU-Net model for given images.
@@ -432,7 +719,7 @@ def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_na
         tile_step_size=0.8,
         use_gaussian=True,
         use_mirroring=False,
-        perform_everything_on_device=True,
+        perform_everything_on_device=False,
         device=torch.device(get_device()),
         verbose=verbose,
         verbose_preprocessing=verbose,
@@ -444,7 +731,6 @@ def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_na
     img, props = load_images(images)
 
     #save_prediction_slice(images[0])
-
 
     prediction = predictor.predict_single_npy_array(img, props, None, None, False)
     prediction_image = sitk.GetImageFromArray(prediction)
@@ -490,6 +776,7 @@ def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[
     logging.debug(f"Cropped to size: {roi_size}, start: {roi_start}")
     return roi_size, roi_start
 
+
 def download_model(model_path: str, url: str):
     """
     Download a zip file from a URL, extract its contents into the specified path,
@@ -525,6 +812,7 @@ def download_model(model_path: str, url: str):
     os.remove(filename)
     print(f"Deleted {filename}")
     
+
 def download_models_from_file():
     # Get the directory path where the file is located
     configure_environment_variables()
@@ -554,6 +842,7 @@ def download_models_from_file():
                     dataset_id, url = parts
                     download_model(models_dir, url.strip())
 
+
 def fill_cropped_image_into_original(cropped_image: sitk.Image, original_image: sitk.Image, roi_size: Tuple[int, int, int], roi_start: Tuple[int, int, int]) -> sitk.Image:
     """
     Fill the cropped image into the original image dimensions based on ROI.
@@ -582,7 +871,8 @@ def fill_cropped_image_into_original(cropped_image: sitk.Image, original_image: 
     logging.debug(f"Restoring size from: {cropped_image.GetSize()} to: {filled_image.GetSize()}")
     return filled_image
 
-def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataFrame, multilabel: bool, force_split: bool = True) -> List[Tuple[sitk.Image, int]]:
+
+def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataFrame, force_split: bool = True) -> List[Tuple[sitk.Image, int]]:
     """
     Process an image using the specified model.
     
@@ -590,7 +880,6 @@ def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataF
         images (list): List of ITK images to process.
         model (dict): Model configuration.
         df (DataFrame): DataFrame with model information.
-        multilabel (bool): Flag to enable multilabel mode.
         force_split (bool): Flag to force splitting. Default is True.
         
     Returns:
@@ -613,16 +902,15 @@ def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataF
             if label_row.empty:
                 logging.info(f'Labelrow empty: {label}')
                 continue  # Skip if the label does not exist in the DataFrame
-            #binary_segmentation = extract_largest_connected_component(segmentation == label)
             binary_segmentation = segmentation == label
-            if multilabel:
-                multilabel_value = label_row['MULTILABEL'].values[0]
-                binary_segmentation = sitk.Cast(binary_segmentation, sitk.sitkUInt16) * multilabel_value
+            # Assign new multilabel labels
+            multilabel_value = label_row['MULTILABEL'].values[0]
+            binary_segmentation = sitk.Cast(binary_segmentation, sitk.sitkUInt16) * multilabel_value
             processed_segments.append((binary_segmentation, label))
     return processed_segments
 
 
-def save_segmentation_result(output_path: str, image_base: str, model_base: str, segmentation: sitk.Image, label_name: str, multilabel: bool, properties_list: dict, name: Optional[str] = None):
+def save_segmentation_result(output_path: str, image_base: str, model_base: str, segmentation: sitk.Image, label_names: dict, multilabel: bool, properties_list: dict, name: Optional[str] = None):
     """
     Save the segmentation to the specified output path.
     
@@ -631,31 +919,45 @@ def save_segmentation_result(output_path: str, image_base: str, model_base: str,
         image_base (str): Base name of the image.
         model_base (str): Base name of the model.
         segmentation (SimpleITK.Image): Segmentation image.
-        label_name (str): Label name.
+        label_names (dict): Dictionary of label names.
         multilabel (bool): Flag to enable multilabel mode.
         name (str, optional): Optional name for saving the segmentation.
     """
+
     if multilabel:
         logging.info('Saving multilabel file')
         filename = f"{name}.nii.gz"
         output_name = os.path.join(output_path, image_base, filename)
+        os.makedirs(os.path.dirname(output_name), exist_ok=True)
+        logging.info(f'Saving {output_name}')
+        segmentation = sitk.Cast(segmentation, sitk.sitkUInt16)
+        write_image(segmentation, output_name, properties_list)
     else:
-        filename = f"{label_name}.nii.gz"
-        output_name = os.path.join(output_path, image_base, model_base, filename)
-    
-
-    os.makedirs(os.path.dirname(output_name), exist_ok=True)
-    logging.info(f'Saving {output_name}')
-
-    segmentation = sitk.Cast(segmentation, sitk.sitkUInt16)
-
-    write_image(segmentation, output_name, properties_list)
-    #sitk.WriteImage(segmentation, output_name)
+        segmentation_array = sitk.GetArrayFromImage(segmentation)
+        labels = np.unique(segmentation_array[segmentation_array > 0])
+        for label in labels:
+            if label in label_names:
+                filename = f"{label_names[label]}.nii.gz"
+                output_name = os.path.join(output_path, image_base, model_base, filename)
+                os.makedirs(os.path.dirname(output_name), exist_ok=True)
+                logging.info(f'Saving {output_name}')
+                label_image_array = (segmentation_array == label).astype(np.uint8)
+                if np.any(label_image_array):
+                    label_image = sitk.GetImageFromArray(label_image_array)
+                    label_image.CopyInformation(segmentation)
+                    label_image = sitk.Cast(label_image, sitk.sitkUInt16)
+                    write_image(label_image, output_name, properties_list)
+                    logging.debug(f'Successfully saved {output_name} with label {label}')
+                else:
+                    logging.warning(f"Label {label} has no data and will not be saved.")
+            else:
+                logging.warning(f"Label {label} not found in label names dictionary and will be skipped.")
 
 
 def run_multi_model_prediction(image_paths: List[str], models: List[dict], output: str, 
                                df: pd.DataFrame, multilabel: bool = False, force_split: bool = True,
-                                crop_trunk: bool = False, name: Optional[str] = None, reorient: bool = True):
+                                crop_trunk: bool = False, name: Optional[str] = None, reorient: bool = True, 
+                                largest_cc: bool = True, repair: bool = True):
     """
     Perform multiple predictions on a set of images using a list of models.
     
@@ -680,122 +982,41 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
         images = [sitk.RegionOfInterest(im, size=roi_size, index=roi_start) for im in images]
     
     image_base = os.path.basename(image_paths[0]).split('.')[0]
-    combined_segmentation = None if multilabel else []
-
+    combined_segmentation = None
+    label_names = {}
     for model in models:
         model_base = os.path.basename(model['path']).split('_')[0]
         model_path = os.path.join(model['path'], "__".join([model['trainer'], 'nnUNetPlans', model['config']]))
         logging.info(f"Running Model {model['path']}")
         logging.debug(f"Configuration {model}")
-        processed_segments = process_image_with_model(images, model, df, multilabel, force_split=force_split)
+        processed_segments = process_image_with_model(images, model, df, force_split=force_split)
 
         for binary_segmentation, label in processed_segments:
             if crop_trunk:
                 processed_segments = fill_cropped_image_into_original(binary_segmentation, original_image, roi_size, roi_start)
             
             label_name = fetch_label_name_from_json(model_path, label)
+            label_names[label] = label_name
+
             logging.debug(f"Fetched label name: {label_name} for label: {label}")
 
-            if multilabel:
-                if combined_segmentation is None:
-                    combined_segmentation = binary_segmentation
-                else:
-                    mask = sitk.Equal(combined_segmentation, 0)
-                    masked_segmentation = sitk.Mask(binary_segmentation, mask)
-                    combined_segmentation = sitk.Add(combined_segmentation, masked_segmentation)
+            if combined_segmentation is None:
+                combined_segmentation = binary_segmentation
+                
             else:
-                save_segmentation_result(output, image_base, model_base, binary_segmentation, label_name, multilabel, properties_list[0], name=name)
-    
-    if multilabel:
-        save_segmentation_result(output, image_base, model_base, combined_segmentation, None, multilabel, properties_list[0], name=name)
+                mask = sitk.Equal(combined_segmentation, 0)
+                masked_segmentation = sitk.Mask(binary_segmentation, mask)
+                combined_segmentation = sitk.Add(combined_segmentation, masked_segmentation)
 
-
-def read_image(file_path, reorient=True):
-    """
-    Read a NIfTI image, optionally reorient to RAS using nibabel, and convert it to a SimpleITK image.
-    
-    Parameters:
-    file_path (str): Path to the NIfTI image file.
-    reorient (bool): Whether to reorient the image to RAS. Default is True.
-    
-    Returns:
-    SimpleITK.Image: The reoriented image as a SimpleITK image.
-    dict: Properties including original and reoriented affines.
-    """
-    # Load the image using nibabel
-    nib_image = nib.load(file_path)
-    
-    # Ensure the image is 3D
-    assert nib_image.ndim == 3, 'Only 3D images are supported.'
-    
-    # Get the original affine
-    original_affine = nib_image.affine
-
-    if reorient:
-        # Reorient the image to RAS
-        orig_ornt = io_orientation(original_affine)
-        target_ornt = [[0, 1], [1, 1], [2, 1]]
-        transform = nib.orientations.ornt_transform(orig_ornt, target_ornt)
-        reoriented_data = apply_orientation(nib_image.get_fdata(), transform)
-        
-        # Compute the reoriented affine
-        reoriented_affine = np.dot(original_affine, inv_ornt_aff(transform, nib_image.shape))
-    else:
-        reoriented_data = nib_image.get_fdata()
-        reoriented_affine = original_affine
-    
-    # Convert to SimpleITK image
-    sitk_image = sitk.GetImageFromArray(reoriented_data.transpose(2, 1, 0))
-    spacing = list(map(float, reversed(nib_image.header.get_zooms())))
-    sitk_image.SetSpacing(spacing)
-    sitk_image.SetOrigin(tuple(reoriented_affine[:3, 3]))
-    sitk_image.SetDirection(reoriented_affine[:3, :3].flatten().tolist())
-
-    properties = {
-        'original_affine': original_affine,
-        'reoriented_affine': reoriented_affine,
-        'reoriented': reorient
-    }
-    
-    return sitk_image, properties
-
-def write_image(sitk_image, file_path, properties):
-    """
-    Convert a SimpleITK image to a nibabel NIfTI image, optionally reorient back to original orientation, and save it.
-    
-    Parameters:
-    sitk_image (SimpleITK.Image): The SimpleITK image to be saved.
-    file_path (str): Path to save the NIfTI image file.
-    properties (dict): Properties including original and reoriented affines.
-    """
-    original_affine = properties['original_affine']
-    reoriented_affine = properties['reoriented_affine']
-    reoriented = properties['reoriented']
-
-    data = sitk.GetArrayFromImage(sitk_image).transpose(2, 1, 0)
-    if reoriented:
-        orig_ornt = io_orientation(original_affine)
-        target_ornt = io_orientation(reoriented_affine)
-        transform = nib.orientations.ornt_transform(target_ornt, orig_ornt)
-        restored_data = apply_orientation(data, transform)
-    else:
-        restored_data = data
-
-    nifti_image = nib.Nifti1Image(restored_data, original_affine)
-    nib.save(nifti_image, file_path)
-
-def configure_environment_variables():
-    """
-    Set environment variables required for the nnU-Net models.
-    """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    nnunet_models_dir = os.path.join(base_dir, '../models')
-    nnunet_cmd_dir = os.path.join(base_dir, '../cmd')
-    os.environ['NNUNET_MODELS_DIR'] = nnunet_models_dir
-    os.environ['NNUNET_CMD_DIR'] = nnunet_cmd_dir
-
-    logging.info(f"NNUNET_MODELS_DIR is set to {nnunet_models_dir}")
-    logging.info(f"NNUNET_CMD_DIR is set to {nnunet_cmd_dir}")
+    if largest_cc and repair:
+        logging.warning('Exclusive option: Choose either --cc or --repair option')
+    elif largest_cc:
+        combined_segmentation = extract_largest_connected_component_multilabel(combined_segmentation)
+    elif repair:
+        combined_segmentation = repair_multilabel(combined_segmentation, 3)
+    else: # Removing spekles
+        combined_segmentation = remove_small_components_multilabel(combined_segmentation, 250) # 125-500 Random threshold
+    save_segmentation_result(output, image_base, model_base, combined_segmentation, label_names, multilabel, properties_list[0], name=name)
 
 
 def main():
@@ -813,9 +1034,8 @@ def main():
     parser.add_argument('--split', action='store_true', help='Enable splitting mode')
     parser.add_argument('--trunk', action='store_true', help='Enable trunk cropping mode')
     parser.add_argument('--preserve', action='store_true', help='Enable no reorienting of images')
-
-
-
+    parser.add_argument('--cc', action='store_true', help='Enable to keep only largest connected component label')
+    parser.add_argument('--repair', action='store_true', help='Enable repair mode (if more than 1 CC)')
     args = parser.parse_args()
 
     if args.verbose:
@@ -827,8 +1047,6 @@ def main():
     logging_level = logging.getLevelName(logger.getEffectiveLevel())
     logging.info(f"Current logging level: {logging_level}")
     
-
-
     models, df = load_models_from_json(args.cmd)
     
     name = None
@@ -837,7 +1055,7 @@ def main():
     
     logging.info(f"Running on {get_device()}...")
 
-    run_multi_model_prediction(args.image, models, args.output, df, multilabel=args.ml, force_split=args.split, crop_trunk=args.trunk, name=name, reorient=args.preserve==False)
+    run_multi_model_prediction(args.image, models, args.output, df, multilabel=args.ml, force_split=args.split, crop_trunk=args.trunk, name=name, reorient=args.preserve==False, largest_cc=args.cc, repair=args.repair)
 
 
 if __name__ == "__main__":
