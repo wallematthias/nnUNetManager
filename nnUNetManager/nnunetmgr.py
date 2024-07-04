@@ -455,14 +455,15 @@ def remove_small_components(input_image: sitk.Image, min_size: int) -> sitk.Imag
 
 def remove_small_components_multilabel(input_image: sitk.Image, min_size: int) -> sitk.Image:
     """
-    Remove all components smaller than the given threshold from the input multi-label image.
+    Remove all components smaller than the given threshold from the input multi-label image,
+    and also remove small holes by processing the inverse of the label.
     
     Parameters:
         input_image (SimpleITK.Image): The input multi-label image.
         min_size (int): The minimum size (in voxels) for a component to be kept.
         
     Returns:
-        SimpleITK.Image: The image with small components removed.
+        SimpleITK.Image: The image with small components and small holes removed.
     """
     # Get unique labels in the image
     unique_labels = np.unique(sitk.GetArrayViewFromImage(input_image))
@@ -481,8 +482,13 @@ def remove_small_components_multilabel(input_image: sitk.Image, min_size: int) -
         # Remove small components in the binary image
         filtered_binary_image = remove_small_components(binary_image, min_size)
         
-        # Convert the filtered binary image back to the original label
-        filtered_label_image = sitk.BinaryThreshold(filtered_binary_image, lowerThreshold=float(1), upperThreshold=float(1), insideValue=int(label), outsideValue=int(0))
+        # Process the inverse to remove small holes
+        inverse_binary_image = sitk.InvertIntensity(filtered_binary_image, maximum=1)
+        filtered_inverse_binary_image = remove_small_components(inverse_binary_image, min_size)
+        final_binary_image = sitk.InvertIntensity(filtered_inverse_binary_image, maximum=1)
+        
+        # Convert the final binary image back to the original label
+        filtered_label_image = sitk.BinaryThreshold(final_binary_image, lowerThreshold=float(1), upperThreshold=float(1), insideValue=int(label), outsideValue=int(0))
         
         # Cast to same type
         filtered_label_image = sitk.Cast(filtered_label_image, output_image.GetPixelID())
@@ -641,7 +647,7 @@ def perform_prediction(images: List[sitk.Image], path: str, trainer: str, config
 
     img_arrays = [sitk.GetArrayFromImage(im) for im in rescaled_images]
     ss = img_arrays[0].shape
-    nr_voxels_thr = 512 * 512 * 900
+    nr_voxels_thr = 512 * 512 * 512 #900
     do_triple_split = np.prod(ss) > nr_voxels_thr and ss[0] > 200
     if force_split:
         do_triple_split = True
@@ -1014,8 +1020,8 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
         combined_segmentation = extract_largest_connected_component_multilabel(combined_segmentation)
     elif repair:
         combined_segmentation = repair_multilabel(combined_segmentation, 3)
-    else: # Removing spekles
-        combined_segmentation = remove_small_components_multilabel(combined_segmentation, 250) # 125-500 Random threshold
+    
+    combined_segmentation = remove_small_components_multilabel(combined_segmentation, 250) # 125-500 Random threshold
     save_segmentation_result(output, image_base, model_base, combined_segmentation, label_names, multilabel, properties_list[0], name=name)
 
 
