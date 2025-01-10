@@ -23,7 +23,6 @@ from acvl_utils.morphology.morphology_helper import remove_all_but_largest_compo
 from batchgenerators.utilities.file_and_folder_operations import join
 from nibabel.orientations import io_orientation, inv_ornt_aff, apply_orientation
 
-
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -47,80 +46,55 @@ def get_device() -> str:
     return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def read_image(file_path, reorient=True):
+def read_image(file_path):
     """
-    Read a NIfTI image, optionally reorient to RAS using nibabel, and convert it to a SimpleITK image.
+    Read a NIfTI image, optionally reorient to RAS using SimpleITK, and return the image and properties.
     
     Parameters:
     file_path (str): Path to the NIfTI image file.
     reorient (bool): Whether to reorient the image to RAS. Default is True.
     
     Returns:
-    SimpleITK.Image: The reoriented image as a SimpleITK image.
-    dict: Properties including original and reoriented affines.
+    SimpleITK.Image: The reoriented or original image as a SimpleITK image.
+    dict: Properties including original and reoriented directions and origins.
     """
-    # Load the image using nibabel
-    nib_image = nib.load(file_path)
-    
-    # Ensure the image is 3D
-    assert nib_image.ndim == 3, 'Only 3D images are supported.'
-    
-    # Get the original affine
-    original_affine = nib_image.affine
-
-    if reorient:
-        # Reorient the image to RAS
-        orig_ornt = io_orientation(original_affine)
-        target_ornt = [[0, 1], [1, 1], [2, 1]]
-        transform = nib.orientations.ornt_transform(orig_ornt, target_ornt)
-        reoriented_data = apply_orientation(nib_image.get_fdata(), transform)
+    try:
+        # Read the image using SimpleITK
+        sitk_image = sitk.ReadImage(file_path)
         
-        # Compute the reoriented affine
-        reoriented_affine = np.dot(original_affine, inv_ornt_aff(transform, nib_image.shape))
-    else:
-        reoriented_data = nib_image.get_fdata()
-        reoriented_affine = original_affine
-    
-    # Convert to SimpleITK image
-    sitk_image = sitk.GetImageFromArray(reoriented_data.transpose(2, 1, 0))
-    spacing = list(map(float, reversed(nib_image.header.get_zooms())))
-    sitk_image.SetSpacing(spacing)
-    sitk_image.SetOrigin(tuple(reoriented_affine[:3, 3]))
-    sitk_image.SetDirection(reoriented_affine[:3, :3].flatten().tolist())
+        # Store original direction and origin
+        original_direction = sitk_image.GetDirection()
+        original_origin = sitk_image.GetOrigin()
+        #reoriented_image = sitk.DICOMOrient(sitk_image, "RAS")
+        reoriented_image = sitk_image
+        reoriented_direction = reoriented_image.GetDirection()
+        reoriented_origin = reoriented_image.GetOrigin()
+        
+        logging.debug(f'Original Direction: {original_direction} Reoriented direction {reoriented_direction}')
+        
+    except Exception as e:
+        print(f"Error reading image: {e}")
+        raise RuntimeError("Failed to read or reorient the image.")
 
-    properties = {
-        'original_affine': original_affine,
-        'reoriented_affine': reoriented_affine,
-        'reoriented': reorient
-    }
-    
-    return sitk_image, properties
+    return reoriented_image
 
 
-def write_image(sitk_image, file_path, properties):
+def write_image(sitk_image, file_path):
     """
-    Convert a SimpleITK image to a nibabel NIfTI image, optionally reorient back to original orientation, and save it.
+    Save a SimpleITK image, optionally adjusting direction and origin.
     
     Parameters:
     sitk_image (SimpleITK.Image): The SimpleITK image to be saved.
     file_path (str): Path to save the NIfTI image file.
-    properties (dict): Properties including original and reoriented affines.
+    properties (dict): Properties including original direction and origin.
     """
-    original_affine = properties['original_affine']
-    reoriented_affine = properties['reoriented_affine']
-    reoriented = properties['reoriented']
-
-    data = sitk.GetArrayFromImage(sitk_image).transpose(2, 1, 0)
-    if reoriented:
-        orig_ornt = io_orientation(original_affine)
-        target_ornt = io_orientation(reoriented_affine)
-        transform = nib.orientations.ornt_transform(target_ornt, orig_ornt)
-        restored_data = apply_orientation(data, transform)
-    else:
-        restored_data = data
-
-    nifti_image = nib.Nifti1Image(restored_data, original_affine)
-    nib.save(nifti_image, file_path)
+    try:
+        # Save the image
+        sitk.WriteImage(sitk_image, file_path)
+        print(f"Image saved to {file_path}")
+    except Exception as e:
+        print(f"Error saving image: {e}")
+        raise RuntimeError("Failed to save the image.")
 
 
 def extract_spacing_from_plans(file_path: str) -> Union[List[float], str]:
@@ -322,7 +296,7 @@ def rescale_itk_image(itk_image: sitk.Image, target_spacing: Tuple[float, float,
     resampler.SetSize(new_size)
     resampler.SetOutputSpacing(target_spacing)
     resampler.SetTransform(sitk.Transform())
-    resampler.SetInterpolator(sitk.sitkBSpline) #sitkBSpline
+    resampler.SetInterpolator(sitk.sitkLinear) #sitkBSpline
     resampler.SetOutputOrigin(itk_image.GetOrigin())
     resampler.SetOutputDirection(itk_image.GetDirection())
 
@@ -419,7 +393,7 @@ def extract_largest_connected_component(input_image: sitk.Image) -> sitk.Image:
         return input_image
 
     largest_label = max(labels, key=label_shape_filter.GetNumberOfPixels)
-    logging.debug(f"Largest label identified: {largest_label} with {label_shape_filter.GetNumberOfPixels(largest_label)} pixels.")
+    logging.debug(f"Largest label identified: {largest_label} out of {len(labels)} with {label_shape_filter.GetNumberOfPixels(largest_label)} pixels.")
 
     largest_component = sitk.BinaryThreshold(connected_components, lowerThreshold=largest_label, upperThreshold=largest_label, insideValue=1, outsideValue=0)
     return largest_component
@@ -549,7 +523,7 @@ def repair_multilabel(segmentation_image: sitk.Image, min_size: int) -> sitk.Ima
                 component_array = sitk.GetArrayFromImage(component_mask).astype(bool)
                  
                 # Find the best connected neighbor for this component in the original image
-                dilated_mask = binary_dilation(component_array) & (component_array == 0)
+                dilated_mask = binary_dilation(component_array, iterations=1) & (component_array == 0)
                 neighbor_labels = segmentation_array[dilated_mask & (segmentation_array > 0)]
                 unique_neighbors, counts = np.unique(neighbor_labels, return_counts=True)
 
@@ -566,6 +540,7 @@ def repair_multilabel(segmentation_image: sitk.Image, min_size: int) -> sitk.Ima
                         logging.warning(f'There seems to be a duplicate label/unconnected component for label: {label} that cannot be resolved')
 
                 else:
+                    logging.debug(f'Label {label}: has no neigbours')
                     repaired_array[component_array] = 0
     
     repaired_image = sitk.GetImageFromArray(repaired_array)
@@ -620,7 +595,7 @@ def extract_largest_connected_component_multilabel(input_image: sitk.Image) -> s
     return output_image
 
 
-def perform_prediction(images: List[sitk.Image], path: str, trainer: str, config: str, checkpoint_name: str = 'checkpoint_final.pth', fold: int = 0, target_spacing: Optional[Tuple[float, float, float]] = None, force_split: bool = True) -> sitk.Image:
+def perform_prediction(images: List[sitk.Image], path: str, trainer: str, config: str, checkpoint_name: str = 'checkpoint_final.pth', fold = 0, target_spacing: Optional[Tuple[float, float, float]] = None, force_split: bool = True) -> sitk.Image:
     """
     Predict the output for a given image, potentially splitting it into subparts if needed.
     
@@ -647,7 +622,7 @@ def perform_prediction(images: List[sitk.Image], path: str, trainer: str, config
 
     img_arrays = [sitk.GetArrayFromImage(im) for im in rescaled_images]
     ss = img_arrays[0].shape
-    nr_voxels_thr = 512 * 512 * 512 #900
+    nr_voxels_thr = 900 * 900 * 900 #512
     do_triple_split = np.prod(ss) > nr_voxels_thr and ss[0] > 200
     if force_split:
         do_triple_split = True
@@ -705,7 +680,7 @@ def save_prediction_slice(image: sitk.Image):
     logging.info(f"Saved prediction slice as {random_filename}")
 
 
-def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_name: str = 'checkpoint_final.pth', fold: int = 0) -> sitk.Image:
+def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_name: str = 'checkpoint_final.pth', fold=0) -> sitk.Image:
     """
     Predict output using a nnU-Net model for given images.
     
@@ -713,13 +688,16 @@ def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_na
         images (list): List of ITK images for prediction.
         model_path (str): Path to the trained nnUNet model directory.
         checkpoint_name (str): Checkpoint file name. Default is 'checkpoint_final.pth'.
-        fold (int): Fold number. Default is 0.
+        fold (int or list): Fold number(s). Default is 0.
         
     Returns:
         SimpleITK.Image: ITK image of the prediction.
     """
     logger = logging.getLogger()
     verbose = logger.getEffectiveLevel() == logging.DEBUG
+
+    # Ensure fold is a list
+    folds = [fold] if not isinstance(fold, list) else fold
 
     predictor = nnUNetPredictor(
         tile_step_size=0.8,
@@ -732,19 +710,15 @@ def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_na
         allow_tqdm=True
     )
 
-    predictor.initialize_from_trained_model_folder(model_path, use_folds=(fold,), checkpoint_name=checkpoint_name)
+    predictor.initialize_from_trained_model_folder(model_path, use_folds=folds, checkpoint_name=checkpoint_name)
 
     img, props = load_images(images)
-
-    #save_prediction_slice(images[0])
 
     prediction = predictor.predict_single_npy_array(img, props, None, None, False)
     prediction_image = sitk.GetImageFromArray(prediction)
     prediction_image.SetSpacing(images[0].GetSpacing())
     prediction_image.SetOrigin(images[0].GetOrigin())
     prediction_image.SetDirection(images[0].GetDirection())
-
-    #save_prediction_slice(prediction_image)
 
     return prediction_image
 
@@ -782,6 +756,27 @@ def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[
     logging.debug(f"Cropped to size: {roi_size}, start: {roi_start}")
     return roi_size, roi_start
 
+def crop_image_to_label(image: sitk.Image, seglabel: int) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """
+    Crop the input image to the trunk region using a pre-trained nnU-Net model.
+    
+    Parameters:
+        image (SimpleITK.Image): Input image to be cropped.
+        
+    Returns:
+        tuple: ROI size and start index for cropping.
+    """
+
+    binary_seg = sitk.Cast(image == seglabel, sitk.sitkUInt8)
+
+    label_stats = sitk.LabelShapeStatisticsImageFilter()
+    label_stats.Execute(binary_seg)
+    bounding_box = label_stats.GetBoundingBox(1)
+    roi_size = bounding_box[3:6]
+    roi_start = bounding_box[0:3]
+    logging.debug(f"Original size: {image.GetSize()}")
+    logging.debug(f"Cropped to size: {roi_size}, start: {roi_start}")
+    return roi_size, roi_start
 
 def download_model(model_path: str, url: str):
     """
@@ -866,15 +861,26 @@ def fill_cropped_image_into_original(cropped_image: sitk.Image, original_image: 
     cropped_image = sitk.Cast(cropped_image, pixel_type)
     original_image = sitk.Cast(original_image, pixel_type)
 
-    empty_img = sitk.Image(original_image.GetSize(), original_image.GetPixelID())
+    # Verify ROI is within original image bounds
+    original_size = original_image.GetSize()
+    if any(roi_start[i] + roi_size[i] > original_size[i] for i in range(3)):
+        raise ValueError("ROI extends beyond the original image dimensions.")
+
+    empty_img = sitk.Image(original_image.GetSize(), pixel_type)
     empty_img.CopyInformation(original_image)
 
     paste_filter = sitk.PasteImageFilter()
     paste_filter.SetDestinationIndex(roi_start)
-    paste_filter.SetSourceSize(cropped_image.GetSize())
+    paste_filter.SetSourceSize(roi_size)  # Ensure source size matches ROI size
 
     filled_image = paste_filter.Execute(empty_img, cropped_image)
-    logging.debug(f"Restoring size from: {cropped_image.GetSize()} to: {filled_image.GetSize()}")
+
+    # Log where the cropped image is pasted
+    logging.debug(f"Filled cropped image into original at ROI start: {roi_start} with size: {roi_size}.")
+    logging.debug(f"Destination index set to: {roi_start}")
+    logging.debug(f"Source size set to: {roi_size}")
+    logging.debug(f"Restoring size from: {cropped_image.GetSize()} to: {original_image.GetSize()}")
+
     return filled_image
 
 
@@ -916,7 +922,7 @@ def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataF
     return processed_segments
 
 
-def save_segmentation_result(output_path: str, image_base: str, model_base: str, segmentation: sitk.Image, label_names: dict, multilabel: bool, properties_list: dict, name: Optional[str] = None):
+def save_segmentation_result(output_path: str, image_base: str, model_base: str, segmentation: sitk.Image, label_names: dict, multilabel: bool, name: Optional[str] = None):
     """
     Save the segmentation to the specified output path.
     
@@ -933,18 +939,18 @@ def save_segmentation_result(output_path: str, image_base: str, model_base: str,
     if multilabel:
         logging.info('Saving multilabel file')
         filename = f"{name}.nii.gz"
-        output_name = os.path.join(output_path, image_base, filename)
+        output_name = os.path.join(output_path, image_base, f'{image_base}_{filename}')
         os.makedirs(os.path.dirname(output_name), exist_ok=True)
         logging.info(f'Saving {output_name}')
         segmentation = sitk.Cast(segmentation, sitk.sitkUInt16)
-        write_image(segmentation, output_name, properties_list)
+        write_image(segmentation, output_name)
     else:
         segmentation_array = sitk.GetArrayFromImage(segmentation)
         labels = np.unique(segmentation_array[segmentation_array > 0])
         for label in labels:
             if label in label_names:
                 filename = f"{label_names[label]}.nii.gz"
-                output_name = os.path.join(output_path, image_base, model_base, filename)
+                output_name = os.path.join(output_path, image_base, f'{image_base}_{model_base}_{filename}')
                 os.makedirs(os.path.dirname(output_name), exist_ok=True)
                 logging.info(f'Saving {output_name}')
                 label_image_array = (segmentation_array == label).astype(np.uint8)
@@ -952,7 +958,7 @@ def save_segmentation_result(output_path: str, image_base: str, model_base: str,
                     label_image = sitk.GetImageFromArray(label_image_array)
                     label_image.CopyInformation(segmentation)
                     label_image = sitk.Cast(label_image, sitk.sitkUInt16)
-                    write_image(label_image, output_name, properties_list)
+                    write_image(label_image, output_name)
                     logging.debug(f'Successfully saved {output_name} with label {label}')
                 else:
                     logging.warning(f"Label {label} has no data and will not be saved.")
@@ -979,14 +985,14 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
     """
     
 
-    results = [read_image(image_path, reorient) for image_path in image_paths]
-    images, properties_list = zip(*results)
+    images = [read_image(image_path) for image_path in image_paths]
 
     if crop_trunk: 
         original_image = images[0]
         roi_size, roi_start = crop_image_to_trunk(original_image)
         images = [sitk.RegionOfInterest(im, size=roi_size, index=roi_start) for im in images]
     
+
     image_base = os.path.basename(image_paths[0]).split('.')[0]
     combined_segmentation = None
     label_names = {}
@@ -999,7 +1005,7 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
 
         for binary_segmentation, label in processed_segments:
             if crop_trunk:
-                processed_segments = fill_cropped_image_into_original(binary_segmentation, original_image, roi_size, roi_start)
+                binary_segmentation = fill_cropped_image_into_original(binary_segmentation, original_image, roi_size, roi_start)
             
             label_name = fetch_label_name_from_json(model_path, label)
             label_names[label] = label_name
@@ -1022,7 +1028,134 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
         combined_segmentation = repair_multilabel(combined_segmentation, 3)
     
     combined_segmentation = remove_small_components_multilabel(combined_segmentation, 250) # 125-500 Random threshold
-    save_segmentation_result(output, image_base, model_base, combined_segmentation, label_names, multilabel, properties_list[0], name=name)
+    save_segmentation_result(output, image_base, model_base, combined_segmentation, label_names, multilabel, name=name)
+
+
+def fill_mask_via_dilation(relabeled_mask, original_mask, max_iterations=15):
+    logging.info('Starting the dilation process.')
+    original_array = sitk.GetArrayFromImage(original_mask)
+    relabeled_array = sitk.GetArrayFromImage(relabeled_mask)
+
+    allowable_area = (original_array > 0) & (relabeled_array == 0)
+    logging.debug(f'Initial allowable area size: {np.sum(allowable_area)}')
+
+    labels = np.unique(relabeled_array)[1:]  # Exclude background
+    if not labels.size:
+        logging.warning("No labels found for dilation. Exiting.")
+        return relabeled_mask
+
+    iteration = 0
+    any_change = True
+
+    while any_change and iteration < max_iterations:
+        logging.debug(f'Iteration {iteration + 1}')
+        any_change = False
+        updated_mask = np.copy(relabeled_array)
+
+        for label in labels:
+            current_label_mask = (relabeled_array == label)
+            dilated_label_mask = binary_dilation(current_label_mask, structure=np.ones((3,3,3)))
+
+            new_dilation = dilated_label_mask & allowable_area
+            changes = np.sum(new_dilation != (current_label_mask & allowable_area))
+            logging.debug(f'Attempting to fill {changes} pixels for label {label}')
+
+            if changes > 0:
+                updated_mask[new_dilation] = label
+                any_change = True
+
+        relabeled_array = updated_mask
+        allowable_area = (original_array > 0) & (relabeled_array == 0)
+        logging.debug(f'Updated allowable area size: {np.sum(allowable_area)}')
+
+        iteration += 1
+
+    output_image = sitk.GetImageFromArray(relabeled_array)
+    output_image.CopyInformation(relabeled_mask)
+    logging.info('Dilation process completed.')
+    return output_image
+
+
+def run_relabel(image_paths: List[str], models: List[dict], output: str, 
+                               df: pd.DataFrame, label_image_pos=1, multilabel: bool = False, force_split: bool = True,
+                                name: Optional[str] = None, reorient: bool = True, 
+                                largest_cc: bool = True, repair: bool = True):
+    """
+    Perform multiple predictions on a set of images using a list of models.
+    
+    Parameters:
+        image_paths (list): List of paths to the input images. Give Segmentation FIRST
+        models (list): List of models to be used for prediction.
+        output (str): Directory where the output segmentations will be saved.
+        df (DataFrame): DataFrame containing additional information required for processing.
+        multilabel (bool): Flag to enable multilabel mode. Default is False.
+        force_split (bool): Flag to force splitting of the data. Default is True.
+        crop_trunk (bool): Flag to enable cropping to the trunk region. Default is False.
+        name (str, optional): Optional name for saving the segmentation. Default is None.
+    """
+    
+
+    images = [read_image(image_path) for image_path in image_paths]
+    original_image=images[label_image_pos]
+    max_label = len(np.unique(sitk.GetArrayFromImage(images[label_image_pos]))[1:])
+    logging.info(f"Found {max_label} for relabeling")
+    all_labels_combined = None
+
+    for label in np.unique(sitk.GetArrayFromImage(images[label_image_pos]))[1:]:    
+        logging.info(f"Running relabelling model for label #: {label}")
+        combined_segmentation = None
+
+        roi_size, roi_start = crop_image_to_label(images[label_image_pos], label)
+        
+        cropped_images = [sitk.RegionOfInterest(im, size=roi_size, index=roi_start) for im in images]
+        binary_mask = cropped_images[label_image_pos]==label
+        cropped_images[label_image_pos] = binary_mask
+
+        image_base = os.path.basename(image_paths[0]).split('.')[0]
+        label_names = {}
+        for model in models:
+            model_base = os.path.basename(model['path']).split('_')[0]
+            model_path = os.path.join(model['path'], "__".join([model['trainer'], 'nnUNetPlans', model['config']]))
+            logging.info(f"Running Model {model['path']}")
+            logging.debug(f"Configuration {model}")
+            processed_segments = process_image_with_model(cropped_images, model, df, force_split=force_split)
+
+            for binary_segmentation, label in processed_segments:
+                binary_segmentation = fill_cropped_image_into_original(binary_segmentation, original_image, roi_size, roi_start)
+                
+                label_name = fetch_label_name_from_json(model_path, label)
+                label_names[label] = label_name
+
+                logging.debug(f"Fetched label name: {label_name} for label: {label}")
+
+                if combined_segmentation is None:
+                    combined_segmentation = binary_segmentation      
+                else:
+                    mask = sitk.Equal(combined_segmentation, 0)
+                    masked_segmentation = sitk.Mask(binary_segmentation, mask)
+                    combined_segmentation = sitk.Add(sitk.Cast(combined_segmentation, sitk.sitkInt16), sitk.Cast(masked_segmentation, sitk.sitkInt16) )
+
+                if largest_cc and repair:
+                    logging.warning('Exclusive option: Choose either --cc or --repair option')
+                elif largest_cc:
+                    logging.info('Starting largest_CC...')
+                    combined_segmentation = extract_largest_connected_component_multilabel(combined_segmentation)
+                elif repair:
+                    logging.info('Starting repair...')
+                    combined_segmentation = repair_multilabel(combined_segmentation, 3)
+
+            if all_labels_combined is None:
+                all_labels_combined = combined_segmentation
+            else:
+                mask = sitk.Equal(all_labels_combined, 0)
+                masked_segmentation = sitk.Mask(combined_segmentation, mask)
+                all_labels_combined = sitk.Add(sitk.Cast(all_labels_combined, sitk.sitkInt16), sitk.Cast(masked_segmentation, sitk.sitkInt16) )
+
+
+
+    all_labels_combined = remove_small_components_multilabel(all_labels_combined, 125) # 125-500 Random threshold
+    all_labels_combined = fill_mask_via_dilation(all_labels_combined, original_image, max_iterations=15)
+    save_segmentation_result(output, image_base, model_base, all_labels_combined, label_names, multilabel, name=name)
 
 
 def main():
@@ -1033,7 +1166,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='Process some images.')
     parser.add_argument('cmd', help='Command file name')
-    parser.add_argument('--image', required=True, nargs='+', help='Path(s) to the input image(s). Multiple images only for multimodal predictions')
+    parser.add_argument('--image', required=True, nargs='+', help='Path(s) to the input image(s). Multiple images only for multimodal predictions. Supports glob patterns.')
     parser.add_argument('--output', required=True, help='Path to the output directory')
     parser.add_argument('--ml', action='store_true', help='Enable multilabel mode')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose mode')
@@ -1042,6 +1175,8 @@ def main():
     parser.add_argument('--preserve', action='store_true', help='Enable no reorienting of images')
     parser.add_argument('--cc', action='store_true', help='Enable to keep only largest connected component label')
     parser.add_argument('--repair', action='store_true', help='Enable repair mode (if more than 1 CC)')
+    parser.add_argument('--relabel', action='store_true', help='Enable repair mode (if more than 1 CC)')
+    
     args = parser.parse_args()
 
     if args.verbose:
@@ -1053,6 +1188,29 @@ def main():
     logging_level = logging.getLevelName(logger.getEffectiveLevel())
     logging.info(f"Current logging level: {logging_level}")
     
+    # Expand and sort images for multimodal pairing
+    multimodal_images = []
+    for pattern in args.image:
+        matched_files = sorted(glob(pattern))
+        if not matched_files:
+            logging.error(f"No matching files found for pattern: {pattern}")
+            return
+        multimodal_images.append(matched_files)
+
+    # Determine single-label or multimodal
+    if len(multimodal_images) == 1:
+        # Single-label case: Treat each file as an independent input
+        paired_images = [(image,) for image in multimodal_images[0]]
+    else:
+        # Multimodal case: Ensure the number of images match and pair them
+        if not all(len(modality) == len(multimodal_images[0]) for modality in multimodal_images):
+            logging.error("The number of images in each modality does not match. Ensure all glob patterns produce the same number of files.")
+            return
+        # Pair images across modalities
+        paired_images = list(zip(*multimodal_images))
+
+    logging.info(f"Paired images: {paired_images}")
+    
     models, df = load_models_from_json(args.cmd)
     
     name = None
@@ -1060,13 +1218,18 @@ def main():
         name = os.path.basename(args.cmd)
     
     logging.info(f"Running on {get_device()}...")
-
-    run_multi_model_prediction(args.image, models, args.output, df, multilabel=args.ml, force_split=args.split, crop_trunk=args.trunk, name=name, reorient=args.preserve==False, largest_cc=args.cc, repair=args.repair)
-
+    if args.relabel:
+        for image_set in paired_images:
+            logging.info(f"Processing image set: {image_set}")
+            run_relabel(list(image_set), models, args.output, df, multilabel=args.ml, force_split=args.split, name=name, reorient=args.preserve==False, largest_cc=args.cc, repair=args.repair)
+    else:
+        for image_set in paired_images:
+            logging.info(f"Processing image set: {image_set}")
+            run_multi_model_prediction(list(image_set), models, args.output, df, multilabel=args.ml, force_split=args.split, crop_trunk=args.trunk, name=name, reorient=args.preserve==False, largest_cc=args.cc, repair=args.repair)
 
 if __name__ == "__main__":
     """
     Example command:
-    nnunetmgr bonelabvertebra --image /path/to/image.nii.gz --output /path/to/output --ml --verbose --trunk
+    nnunetmgr bonelabvertebra --image "/path/to/images/*_0000.nii.gz" --output /path/to/output --ml --verbose --trunk
     """
     main()
