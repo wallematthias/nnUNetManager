@@ -23,9 +23,28 @@ from acvl_utils.morphology.morphology_helper import remove_all_but_largest_compo
 from batchgenerators.utilities.file_and_folder_operations import join
 from nibabel.orientations import io_orientation, inv_ornt_aff, apply_orientation
 
+from functools import partial
+import signal
+import multiprocessing
+import sys
+
+# Global variable to track the multiprocessing pool 
+pool = None
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+def signal_handler(signum, frame): #--> avoid zombie processes
+    """
+    Handle termination signals like SIGTERM and SIGINT (Ctrl+C).
+    """
+    global pool
+    print(f"\nReceived signal {signum}. Cleaning up...")
+    if pool:
+        pool.terminate()
+        pool.join()
+    sys.exit(1)
 
 def configure_environment_variables():
     """
@@ -984,6 +1003,19 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
         name (str, optional): Optional name for saving the segmentation. Default is None.
     """
     
+    # Add file exists check 
+    image_base = os.path.basename(image_paths[0]).split('.')[0]
+    filename = f"{name}.nii.gz"
+    output_name = os.path.join(output, image_base, f'{image_base}_{filename}')
+    
+    # --> This was pulled into the main can be depreciated
+    if os.path.exists(output_name):
+        print(f"{output_name} already exists. Skipping processing.")
+        return 0
+    else: 
+        print(f"Processing: {output_name}")
+
+
 
     images = [read_image(image_path) for image_path in image_paths]
 
@@ -993,7 +1025,6 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
         images = [sitk.RegionOfInterest(im, size=roi_size, index=roi_start) for im in images]
     
 
-    image_base = os.path.basename(image_paths[0]).split('.')[0]
     combined_segmentation = None
     label_names = {}
     for model in models:
@@ -1157,76 +1188,152 @@ def run_relabel(image_paths: List[str], models: List[dict], output: str,
     all_labels_combined = fill_mask_via_dilation(all_labels_combined, original_image, max_iterations=15)
     save_segmentation_result(output, image_base, model_base, all_labels_combined, label_names, multilabel, name=name)
 
+def filter_existing_files(image_sets, output_dir, name):
+    """
+    Helper function to filter out image sets whose outputs already exist.
+    """
+    filtered_sets = []
+    for image_set in image_sets:
+        image_base = os.path.basename(image_set[0]).split('.')[0]
+        filename = f"{name}.nii.gz"
+        output_name = os.path.join(output_dir, image_base, f'{image_base}_{filename}')
+        if not os.path.exists(output_name):
+            filtered_sets.append(image_set)
+        else:
+            logging.info(f"{output_name} already exists. Skipping.")
+    return filtered_sets
 
 def main():
     """
     Main function to run the image processing pipeline.
     """
-    configure_environment_variables()
+    global pool  # Allow signal handler to access the pool
+    try:
+        # Set multiprocessing start method to 'spawn' for CUDA compatibility
+        if get_device() == "cuda":
+            multiprocessing.set_start_method('spawn', force=True)
 
-    parser = argparse.ArgumentParser(description='Process some images.')
-    parser.add_argument('cmd', help='Command file name')
-    parser.add_argument('--image', required=True, nargs='+', help='Path(s) to the input image(s). Multiple images only for multimodal predictions. Supports glob patterns.')
-    parser.add_argument('--output', required=True, help='Path to the output directory')
-    parser.add_argument('--ml', action='store_true', help='Enable multilabel mode')
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose mode')
-    parser.add_argument('--split', action='store_true', help='Enable splitting mode')
-    parser.add_argument('--trunk', action='store_true', help='Enable trunk cropping mode')
-    parser.add_argument('--preserve', action='store_true', help='Enable no reorienting of images')
-    parser.add_argument('--cc', action='store_true', help='Enable to keep only largest connected component label')
-    parser.add_argument('--repair', action='store_true', help='Enable repair mode (if more than 1 CC)')
-    parser.add_argument('--relabel', action='store_true', help='Enable repair mode (if more than 1 CC)')
-    
-    args = parser.parse_args()
+        configure_environment_variables()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    else:
-        logging.getLogger().setLevel(logging.INFO)
+        # Register signal handlers
+        signal.signal(signal.SIGINT, signal_handler)  # Handle Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # Handle `kill -TERM`
 
-    logger = logging.getLogger()
-    logging_level = logging.getLevelName(logger.getEffectiveLevel())
-    logging.info(f"Current logging level: {logging_level}")
-    
-    # Expand and sort images for multimodal pairing
-    multimodal_images = []
-    for pattern in args.image:
-        matched_files = sorted(glob(pattern))
-        if not matched_files:
-            logging.error(f"No matching files found for pattern: {pattern}")
+        parser = argparse.ArgumentParser(description='Process some images.')
+        parser.add_argument('cmd', help='Command file name')
+        parser.add_argument('--image', required=True, nargs='+', help='Path(s) to the input image(s). Multiple images only for multimodal predictions. Supports glob patterns.')
+        parser.add_argument('--output', required=True, help='Path to the output directory')
+        parser.add_argument('--ml', action='store_true', help='Enable multilabel mode')
+        parser.add_argument('--verbose', action='store_true', help='Enable verbose mode')
+        parser.add_argument('--split', action='store_true', help='Enable splitting mode')
+        parser.add_argument('--trunk', action='store_true', help='Enable trunk cropping mode')
+        parser.add_argument('--preserve', action='store_true', help='Enable no reorienting of images')
+        parser.add_argument('--cc', action='store_true', help='Enable to keep only largest connected component label')
+        parser.add_argument('--repair', action='store_true', help='Enable repair mode (if more than 1 CC)')
+        parser.add_argument('--relabel', action='store_true', help='Enable repair mode (if more than 1 CC)')
+        parser.add_argument('--mp', type=int, default=0, help='Number of worker processes for parallel processing (0 for no multiprocessing)')
+
+        args = parser.parse_args()
+
+        if args.verbose:
+            logging.getLogger().setLevel(logging.DEBUG)
+        else:
+            logging.getLogger().setLevel(logging.INFO)
+
+        logger = logging.getLogger()
+        logging_level = logging.getLevelName(logger.getEffectiveLevel())
+        logging.info(f"Current logging level: {logging_level}")
+
+        # Expand and sort images for multimodal pairing
+        multimodal_images = []
+        for pattern in args.image:
+            matched_files = sorted(glob(pattern))
+            if not matched_files:
+                logging.error(f"No matching files found for pattern: {pattern}")
+                return
+            multimodal_images.append(matched_files)
+
+        # Determine single-label or multimodal
+        if len(multimodal_images) == 1:
+            paired_images = [(image,) for image in multimodal_images[0]]
+        else:
+            if not all(len(modality) == len(multimodal_images[0]) for modality in multimodal_images):
+                logging.error("The number of images in each modality does not match. Ensure all glob patterns produce the same number of files.")
+                return
+            paired_images = list(zip(*multimodal_images))
+
+        name = os.path.basename(args.cmd) if args.ml else None
+        paired_images = filter_existing_files(paired_images, args.output, name)
+
+        if not paired_images:
+            logging.info("No new images to process. Exiting.")
             return
-        multimodal_images.append(matched_files)
 
-    # Determine single-label or multimodal
-    if len(multimodal_images) == 1:
-        # Single-label case: Treat each file as an independent input
-        paired_images = [(image,) for image in multimodal_images[0]]
-    else:
-        # Multimodal case: Ensure the number of images match and pair them
-        if not all(len(modality) == len(multimodal_images[0]) for modality in multimodal_images):
-            logging.error("The number of images in each modality does not match. Ensure all glob patterns produce the same number of files.")
-            return
-        # Pair images across modalities
-        paired_images = list(zip(*multimodal_images))
+        logging.info(f"Images to process: {len(paired_images)}")
 
-    logging.info(f"Paired images: {paired_images}")
-    
-    models, df = load_models_from_json(args.cmd)
-    
-    name = None
-    if args.ml:
-        name = os.path.basename(args.cmd)
-    
-    logging.info(f"Running on {get_device()}...")
-    if args.relabel:
-        for image_set in paired_images:
-            logging.info(f"Processing image set: {image_set}")
-            run_relabel(list(image_set), models, args.output, df, multilabel=args.ml, force_split=args.split, name=name, reorient=args.preserve==False, largest_cc=args.cc, repair=args.repair)
-    else:
-        for image_set in paired_images:
-            logging.info(f"Processing image set: {image_set}")
-            run_multi_model_prediction(list(image_set), models, args.output, df, multilabel=args.ml, force_split=args.split, crop_trunk=args.trunk, name=name, reorient=args.preserve==False, largest_cc=args.cc, repair=args.repair)
+        models, df = load_models_from_json(args.cmd)
 
+        name = None
+        if args.ml:
+            name = os.path.basename(args.cmd)
+
+        logging.info(f"Running on {get_device()}...")
+
+        # Setup multiprocessing if enabled
+        if args.mp > 0:
+            logging.info(f"Initializing multiprocessing pool with {args.mp} workers")
+            pool = multiprocessing.Pool(processes=args.mp)
+
+        if args.relabel:
+            process_func = partial(process_image_set_relabel, models=models, output_dir=args.output, df=df,
+                                   multilabel=args.ml, force_split=args.split, name=name,
+                                   reorient=not args.preserve, largest_cc=args.cc, repair=args.repair)
+        else:
+            process_func = partial(process_image_set_prediction, models=models, output_dir=args.output, df=df,
+                                   multilabel=args.ml, force_split=args.split, crop_trunk=args.trunk,
+                                   name=name, reorient=not args.preserve, largest_cc=args.cc, repair=args.repair)
+
+        if pool:
+            pool.map(process_func, paired_images)
+        else:
+            for image_set in paired_images:
+                try:
+                    logging.info(f"Processing image set: {image_set}")
+                    if args.relabel:
+                        run_relabel(list(image_set), models, args.output, df, multilabel=args.ml,
+                                    force_split=args.split, name=name, reorient=not args.preserve,
+                                    largest_cc=args.cc, repair=args.repair)
+                    else:
+                        run_multi_model_prediction(list(image_set), models, args.output, df,
+                                                    multilabel=args.ml, force_split=args.split,
+                                                    crop_trunk=args.trunk, name=name,
+                                                    reorient=not args.preserve, largest_cc=args.cc,
+                                                    repair=args.repair)
+                except Exception as e:
+                    logging.error(f"Failed: {image_set} with {e}")
+    finally:
+        if pool:
+            pool.close()
+            pool.join()
+        print("All resources cleaned up. Exiting.")
+
+def process_image_set_prediction(image_set, models, output_dir, df, **kwargs):
+    """Helper function for multiprocessing prediction tasks."""
+    try:
+        logging.info(f"Processing image set: {image_set}")
+        run_multi_model_prediction(list(image_set), models, output_dir, df, **kwargs)
+    except Exception as e:
+        logging.error(f'Failed: {image_set} with {e}')
+
+def process_image_set_relabel(image_set, models, output_dir, df, **kwargs):
+    """Helper function for multiprocessing relabel tasks."""
+    try:
+        logging.info(f"Processing image set: {image_set}")
+        run_relabel(list(image_set), models, output_dir, df, **kwargs)
+    except Exception as e:
+        logging.error(f'Failed: {image_set} with {e}')
+
+  
 if __name__ == "__main__":
     """
     Example command:
