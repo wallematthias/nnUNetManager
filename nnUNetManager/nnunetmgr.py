@@ -15,10 +15,13 @@ import SimpleITK as sitk
 import matplotlib.pyplot as plt
 
 from glob import glob
-from typing import List, Tuple, Union, Optional
+from typing import List, Tuple, Union, Optional, Dict
 from skimage.measure import label
 from scipy.ndimage import binary_dilation
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy
+from nnunetv2.inference.export_prediction import export_prediction_from_logits, \
+    convert_predicted_logits_to_segmentation_with_correct_shape
 from acvl_utils.morphology.morphology_helper import remove_all_but_largest_component
 from batchgenerators.utilities.file_and_folder_operations import join
 from nibabel.orientations import io_orientation, inv_ornt_aff, apply_orientation
@@ -651,13 +654,16 @@ def perform_prediction(images: List[sitk.Image], path: str, trainer: str, config
         split_parts = [split_itk_image(im) for im in rescaled_images]
 
         predictions = []
+        dices = []
         for i, parts in enumerate(zip(*split_parts)):
             logging.info(f"Processing part {i}")
-            prediction_part = predict_with_nnunet(list(parts), model_path, checkpoint_name, fold)
+            prediction_part, dice_part = predict_with_nnunet(list(parts), model_path, checkpoint_name, fold)
+            dices.append(dice_part)
             predictions.append(prediction_part)
         combined_prediction = stitch_itk_image(predictions)
+        dice_dict = mean_dice_from_split(dices)
     else:
-        combined_prediction = predict_with_nnunet(rescaled_images, model_path, checkpoint_name, fold)
+        combined_prediction, dice_dict = predict_with_nnunet(rescaled_images, model_path, checkpoint_name, fold)
 
     combined_prediction.SetSpacing(rescaled_images[0].GetSpacing())
     combined_prediction.SetOrigin(rescaled_images[0].GetOrigin())
@@ -670,7 +676,7 @@ def perform_prediction(images: List[sitk.Image], path: str, trainer: str, config
     resampler.SetInterpolator(sitk.sitkNearestNeighbor)
 
     logging.debug("Resampling prediction to original image dimensions.")
-    return resampler.Execute(combined_prediction)
+    return resampler.Execute(combined_prediction), dice_dict
 
 
 def save_prediction_slice(image: sitk.Image):
@@ -699,7 +705,7 @@ def save_prediction_slice(image: sitk.Image):
     logging.info(f"Saved prediction slice as {random_filename}")
 
 
-def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_name: str = 'checkpoint_final.pth', fold=0) -> sitk.Image:
+def predict_with_nnunet_legacy(images: List[sitk.Image], model_path: str, checkpoint_name: str = 'checkpoint_final.pth', fold=0) -> sitk.Image:
     """
     Predict output using a nnU-Net model for given images.
     
@@ -722,7 +728,7 @@ def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_na
         tile_step_size=0.8,
         use_gaussian=True,
         use_mirroring=False,
-        perform_everything_on_device=False,
+        perform_everything_on_device=True,
         device=torch.device(get_device()),
         verbose=verbose,
         verbose_preprocessing=verbose,
@@ -740,6 +746,222 @@ def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_na
     prediction_image.SetDirection(images[0].GetDirection())
 
     return prediction_image
+
+def dice_score(seg1: np.ndarray, seg2: np.ndarray) -> float:
+    """
+    Compute the Dice score between two segmentation maps.
+
+    Parameters:
+        seg1 (np.ndarray): First segmentation mask.
+        seg2 (np.ndarray): Second segmentation mask.
+
+    Returns:
+        float: Dice score.
+    """
+    intersection = np.sum((seg1 == seg2) * (seg1 > 0))  # Ignore background (class 0)
+    union = np.sum(seg1 > 0) + np.sum(seg2 > 0)
+    return 2.0 * intersection / union if union > 0 else 1.0  # Avoid division by zero
+
+def dice_score_per_class(seg1: np.ndarray, seg2: np.ndarray, num_classes: int) -> dict:
+    """
+    Compute Dice scores per class for two segmentation maps and return as a dictionary.
+
+    Parameters:
+        seg1 (np.ndarray): First segmentation mask.
+        seg2 (np.ndarray): Second segmentation mask.
+        num_classes (int): Number of classes in segmentation.
+
+    Returns:
+        dict: Dictionary mapping class labels to their Dice scores, including overall Dice score.
+    """
+    dice_scores = {}
+    
+    # Compute Dice score for each class
+    for cls in range(num_classes):
+        bin_seg1 = (seg1 == cls).astype(np.uint8)
+        bin_seg2 = (seg2 == cls).astype(np.uint8)
+        dice_scores[cls] = dice_score(bin_seg1, bin_seg2)
+    
+    # Compute overall Dice score
+    dice_scores['overall'] = dice_score(seg1, seg2)
+    
+    return dice_scores
+
+def dice_from_maps(fold_prob_maps: torch.Tensor) -> dict:
+    """
+    Compute the ensemble segmentation using mean probability maps and calculate 
+    the Dice scores for each fold compared to the ensemble.
+
+    Parameters:
+        fold_prob_maps (torch.Tensor): Probability maps of shape (num_folds, num_classes, H, W, D)
+
+    Returns:
+        dict: Dictionary containing Dice scores for each class and overall.
+    """
+    logging.info('Moving probability maps on CPU... (this takes a hot second)') #But was faster overall 
+    # Move probability maps to NumPy first
+    fold_prob_maps_np = fold_prob_maps.cpu().numpy()  # (num_folds, num_classes, H, W, D)
+
+    # Compute ensemble segmentation using mean probabilities + np.argmax (much faster in NumPy)
+    ensemble_segmentation = np.argmax(fold_prob_maps_np.mean(axis=0), axis=0)  # Shape: (H, W, D)
+
+    # Compute Dice scores for each fold
+    class_scores = []
+    overall_scores = []
+    
+    for i in range(fold_prob_maps_np.shape[0]):  # Loop over folds
+        fold_segmentation = np.argmax(fold_prob_maps_np[i], axis=0)  # (H, W, D)
+        scores = dice_score_per_class(fold_segmentation, ensemble_segmentation, fold_prob_maps_np.shape[1])
+        logging.info(f"Dice Score fold {i}: {scores['overall']}")
+        class_scores.append([scores[cls] for cls in range(fold_prob_maps_np.shape[1])])
+        overall_scores.append(scores['overall'])
+    
+    # Compute mean Dice scores per class
+    mean_dice_scores = {cls: np.mean([fold[cls] for fold in class_scores]) for cls in range(fold_prob_maps_np.shape[1])}
+    mean_dice_scores['overall'] = np.mean(overall_scores)
+    
+    logging.info(f"Mean Dice Scores: {mean_dice_scores}")
+
+    return mean_dice_scores
+
+def mean_dice_from_split(mean_dice_scores_list: list) -> dict:
+    """
+    Merge mean Dice scores from multiple parts of an image by averaging duplicates.
+
+    Parameters:
+        mean_dice_scores_list (list): List of dictionaries containing Dice scores for each class.
+
+    Returns:
+        dict: Merged dictionary with averaged Dice scores per class and overall.
+    """
+    if mean_dice_scores_list is None:
+        return {}  # Handle case where input is None
+
+    # Filter out None entries and ensure only valid dictionaries are processed
+    mean_dice_scores_list = [scores for scores in mean_dice_scores_list if isinstance(scores, dict) and scores is not None]
+
+    if not mean_dice_scores_list:
+        return {}  # Handle case where all entries were None
+
+    merged_scores = {}
+
+    # Aggregate scores for each class
+    for scores in mean_dice_scores_list:
+        for cls, score in scores.items():
+            if score is not None:  # Ensure individual scores are valid numbers
+                merged_scores.setdefault(cls, []).append(score)
+
+    # Compute the average for each class
+    return {cls: np.mean(scores) for cls, scores in merged_scores.items() if scores}
+
+def save_dice_scores_to_csv(dice_scores: dict, filename: str):
+    """
+    Save Dice scores dictionary to a CSV file.
+
+    Parameters:
+        dice_scores (dict): Dictionary of Dice scores per class.
+        filename (str): Output CSV file name.
+    """
+    df = pd.DataFrame.from_dict(dice_scores, orient='index', columns=['Dice Score'])
+    df.to_csv(filename, index_label='Class')
+
+def predict_with_nnunet(images: List[sitk.Image], model_path: str, checkpoint_name: str = 'checkpoint_final.pth', fold=[0]) -> Tuple[sitk.Image, float]:
+    """
+    Predict output using a nnU-Net model for given images and compute the mean Dice score 
+    between the final ensemble segmentation and each individual fold.
+
+    Parameters:
+        images (list): List of ITK images for prediction.
+        model_path (str): Path to the trained nnUNet model directory.
+        checkpoint_name (str): Checkpoint file name. Default is 'checkpoint_final.pth'.
+        folds (list): List of fold numbers. Default is [0].
+
+    Returns:
+        Tuple[SimpleITK.Image, float]: ITK image of the final ensemble prediction and the mean Dice score.
+    """
+    logger = logging.getLogger()
+    verbose = logger.getEffectiveLevel() == logging.DEBUG
+
+    # Ensure fold is a list
+    if not isinstance(fold, list): 
+        folds = [fold]
+        use_dice = False 
+    else: 
+        folds = fold
+        use_dice = True 
+
+
+    predictor = nnUNetPredictor(
+        tile_step_size=0.8,
+        use_gaussian=True,
+        use_mirroring=False,
+        perform_everything_on_device=False,  # Keep processing on GPU
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        verbose=verbose,
+        verbose_preprocessing=verbose,
+        allow_tqdm=True
+    )
+
+    img, props = load_images(images)
+
+    # Initialize with the first fold to setup preprocessing
+    predictor.initialize_from_trained_model_folder(model_path, use_folds=[folds[0]], checkpoint_name=checkpoint_name)
+
+    # Preprocess the image manually
+    ppa = PreprocessAdapterFromNpy(
+        [img], [None], [props], [None],
+        predictor.plans_manager, predictor.dataset_json, predictor.configuration_manager,
+        num_threads_in_multithreaded=1, verbose=verbose
+    )
+    dct = next(ppa)  # Preprocessed data dictionary
+
+    fold_prob_maps = []
+
+    for fold in folds:
+        predictor.initialize_from_trained_model_folder(model_path, use_folds=[fold], checkpoint_name=checkpoint_name)
+
+        if verbose:
+            print(f"Predicting fold {fold}...")
+
+        # Run inference on preprocessed data
+        predicted_logits = predictor.predict_logits_from_preprocessed_data(dct['data'])  # Keep on GPU
+        prob_map = torch.softmax(predicted_logits.to(dtype=torch.float32), dim=0)  # No .cpu().numpy() conversion here
+
+        fold_prob_maps.append(prob_map)  # Store as Torch Tensor
+
+    # Stack probability maps into a single tensor (num_folds, num_classes, H, W, D)
+    fold_prob_maps = torch.stack(fold_prob_maps)  # Efficient stacking in PyTorch
+    logging.debug(f"Probability Maps Shape: {fold_prob_maps.shape}")
+
+    # Compute ensemble segmentation (sum + argmax) in Torch
+    ensemble_prediction = convert_predicted_logits_to_segmentation_with_correct_shape(
+        fold_prob_maps.mean(dim=0),  # Use torch.mean() instead of np.mean()
+        predictor.plans_manager,
+        predictor.configuration_manager,
+        predictor.label_manager,
+        dct['data_properties'],
+        return_probabilities=False
+    )
+
+    if use_dice: 
+        logging.info('Calculating Dice Scores (Quality Control)...')
+        mean_dice = dice_from_maps(fold_prob_maps)  # Compute mean directly in Torch
+    else:
+        logging.info('Single Model Prediction, Converting to Output...')
+
+        mean_dice = None
+
+    # Convert ensemble segmentation to ITK image (only now move to CPU and NumPy)
+    prediction_image = sitk.GetImageFromArray(ensemble_prediction)
+    prediction_image.SetSpacing(images[0].GetSpacing())
+    prediction_image.SetOrigin(images[0].GetOrigin())
+    prediction_image.SetDirection(images[0].GetDirection())
+
+    logging.info(f"Prediction completed!")
+
+    return prediction_image, mean_dice
+
+
 
 def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
     """
@@ -762,7 +984,7 @@ def crop_image_to_trunk(image: sitk.Image) -> Tuple[Tuple[int, int, int], Tuple[
         model_paths = glob(os.path.join(home, model_dir))
 
     logging.info(f'Cropping to trunk using {model_paths[0]}')
-    trunc = predict_with_nnunet([image], model_paths[0], checkpoint_name='checkpoint_final.pth', fold=0)
+    trunc, _ = predict_with_nnunet([image], model_paths[0], checkpoint_name='checkpoint_final.pth', fold=0)
 
     binary_seg = sitk.Cast(trunc == 1, sitk.sitkUInt8)
 
@@ -903,9 +1125,9 @@ def fill_cropped_image_into_original(cropped_image: sitk.Image, original_image: 
     return filled_image
 
 
-def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataFrame, force_split: bool = True) -> List[Tuple[sitk.Image, int]]:
+def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataFrame, force_split: bool = True) -> Tuple[List[Tuple[sitk.Image, int]], Optional[Dict[int, float]]]:
     """
-    Process an image using the specified model.
+    Process an image using the specified model. This function relabels the image and updates dice_dict if it is not None.
     
     Parameters:
         images (list): List of ITK images to process.
@@ -914,9 +1136,9 @@ def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataF
         force_split (bool): Flag to force splitting. Default is True.
         
     Returns:
-        list: Processed segments.
+        tuple: Processed segments and updated dice_dict (if available).
     """
-    segmentation = perform_prediction(
+    segmentation, dice_dict = perform_prediction(
         images, 
         model['path'], 
         model['trainer'], 
@@ -926,22 +1148,44 @@ def process_image_with_model(images: List[sitk.Image], model: dict, df: pd.DataF
         target_spacing=None, 
         force_split=force_split
     )
+
     processed_segments = []
-    for label in np.unique(sitk.GetArrayFromImage(segmentation)):
+    updated_dice_dict = None if dice_dict is None else {}
+
+    seg_array = sitk.GetArrayFromImage(segmentation)
+    unique_labels = np.unique(seg_array)
+
+    label_mapping = {}  # To track the mapping from original labels to new labels
+
+    for label in unique_labels:
         if label > 0:
             label_row = df[(df['DATASET'] == os.path.basename(model['path'])) & (df['LABEL'] == label)]
             if label_row.empty:
                 logging.info(f'Labelrow empty: {label}')
                 continue  # Skip if the label does not exist in the DataFrame
-            binary_segmentation = segmentation == label
-            # Assign new multilabel labels
+            
+            # Get the new label
             multilabel_value = label_row['MULTILABEL'].values[0]
-            binary_segmentation = sitk.Cast(binary_segmentation, sitk.sitkUInt16) * multilabel_value
-            processed_segments.append((binary_segmentation, label))
-    return processed_segments
+
+            # Store the mapping
+            label_mapping[label] = multilabel_value
+
+            # Create binary segmentation
+            binary_segmentation = sitk.Cast(segmentation == label, sitk.sitkUInt16) * multilabel_value
+            processed_segments.append((binary_segmentation, multilabel_value))
+
+    # Update dice_dict only if it's not None
+    if dice_dict is not None:
+        for old_label, new_label in label_mapping.items():
+            if old_label in dice_dict:
+                updated_dice_dict[new_label] = dice_dict[old_label]
+    else:
+        updated_dice_dict = None #propagate None
+
+    return processed_segments, updated_dice_dict
 
 
-def save_segmentation_result(output_path: str, image_base: str, model_base: str, segmentation: sitk.Image, label_names: dict, multilabel: bool, name: Optional[str] = None):
+def save_segmentation_result(output_path: str, image_base: str, model_base: str, segmentation: sitk.Image, label_names: dict, multilabel: bool, name: Optional[str] = None, dice_dict: Optional[dict] = None ):
     """
     Save the segmentation to the specified output path.
     
@@ -954,6 +1198,7 @@ def save_segmentation_result(output_path: str, image_base: str, model_base: str,
         multilabel (bool): Flag to enable multilabel mode.
         name (str, optional): Optional name for saving the segmentation.
     """
+
 
     if multilabel:
         logging.info('Saving multilabel file')
@@ -983,7 +1228,12 @@ def save_segmentation_result(output_path: str, image_base: str, model_base: str,
                     logging.warning(f"Label {label} has no data and will not be saved.")
             else:
                 logging.warning(f"Label {label} not found in label names dictionary and will be skipped.")
-
+    
+    if dice_dict is not None:
+        dictname = f"{name}.csv"
+        output_name_dict = os.path.join(output_path, image_base, f'{image_base}_{dictname}')
+        logging.info(f'Saving dice dictionary: {output_name_dict}')
+        save_dice_scores_to_csv(dice_dict,output_name_dict)
 
 def run_multi_model_prediction(image_paths: List[str], models: List[dict], output: str, 
                                df: pd.DataFrame, multilabel: bool = False, force_split: bool = True,
@@ -1027,13 +1277,14 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
 
     combined_segmentation = None
     label_names = {}
+    dice_dicts = []
     for model in models:
         model_base = os.path.basename(model['path']).split('_')[0]
         model_path = os.path.join(model['path'], "__".join([model['trainer'], 'nnUNetPlans', model['config']]))
         logging.info(f"Running Model {model['path']}")
         logging.debug(f"Configuration {model}")
-        processed_segments = process_image_with_model(images, model, df, force_split=force_split)
-
+        processed_segments, dice_dict = process_image_with_model(images, model, df, force_split=force_split)
+        dice_dicts.append(dice_dict)
         for binary_segmentation, label in processed_segments:
             if crop_trunk:
                 binary_segmentation = fill_cropped_image_into_original(binary_segmentation, original_image, roi_size, roi_start)
@@ -1058,8 +1309,9 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
     elif repair:
         combined_segmentation = repair_multilabel(combined_segmentation, 3)
     
+    dice_dict = mean_dice_from_split(dice_dicts) # Need to combine the dicts for multimodels..
     combined_segmentation = remove_small_components_multilabel(combined_segmentation, 250) # 125-500 Random threshold
-    save_segmentation_result(output, image_base, model_base, combined_segmentation, label_names, multilabel, name=name)
+    save_segmentation_result(output, image_base, model_base, combined_segmentation, label_names, multilabel, name=name, dice_dict=dice_dict)
 
 
 def fill_mask_via_dilation(relabeled_mask, original_mask, max_iterations=15):
@@ -1149,7 +1401,7 @@ def run_relabel(image_paths: List[str], models: List[dict], output: str,
             model_path = os.path.join(model['path'], "__".join([model['trainer'], 'nnUNetPlans', model['config']]))
             logging.info(f"Running Model {model['path']}")
             logging.debug(f"Configuration {model}")
-            processed_segments = process_image_with_model(cropped_images, model, df, force_split=force_split)
+            processed_segments, dice_dict = process_image_with_model(cropped_images, model, df, force_split=force_split)
 
             for binary_segmentation, label in processed_segments:
                 binary_segmentation = fill_cropped_image_into_original(binary_segmentation, original_image, roi_size, roi_start)
