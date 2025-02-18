@@ -30,6 +30,10 @@ from functools import partial
 import signal
 import multiprocessing
 import sys
+import threading
+import psutil
+import time
+import gc
 
 # Global variable to track the multiprocessing pool 
 pool = None
@@ -48,6 +52,85 @@ def signal_handler(signum, frame): #--> avoid zombie processes
         pool.terminate()
         pool.join()
     sys.exit(1)
+
+
+
+def memory_monitor(threshold_ratio=0.8, check_interval=1, log_interval=10):
+    """
+    Monitor total memory usage (including main and worker processes)
+    and log usage as a percentage every `log_interval` seconds.
+
+    :param threshold_ratio: Fraction of total memory that triggers a warning (e.g., 0.8 = 80%).
+    :param check_interval: Time in seconds between memory checks.
+    :param log_interval: Time in seconds between log updates.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+    main_pid = os.getpid()  # Get the main process ID
+    total_ram = psutil.virtual_memory().total  # Total system memory in bytes
+    threshold = total_ram * threshold_ratio  # Set warning threshold dynamically
+
+    logging.info(f"Monitoring Total Memory... System: {total_ram / (1024**3):.2f} GB, Threshold: {threshold / (1024**3):.2f} GB ({threshold_ratio * 100:.0f}%)")
+
+    last_log_time = time.time()  # Track last print time
+
+    while True:
+        # Get memory usage of the main process
+        total_mem_usage = psutil.Process(main_pid).memory_info().rss
+
+        # Get memory usage of all child processes (workers in multiprocessing pool)
+        for child in psutil.Process(main_pid).children(recursive=True):
+            total_mem_usage += child.memory_info().rss
+
+        # Calculate memory usage percentage
+        usage_percent = (total_mem_usage / total_ram) * 100
+
+        # Log memory usage every `log_interval` seconds
+        if time.time() - last_log_time >= log_interval:
+            logging.info(f"Total Memory Usage: {usage_percent:.2f}%")
+            last_log_time = time.time()  # Reset log timer
+
+        # Log a warning if memory exceeds threshold
+        if total_mem_usage > threshold:
+            logging.warning(f"⚠ HIGH MEMORY USAGE: {usage_percent:.2f}% (Threshold: {threshold_ratio * 100:.0f}%)")
+
+        time.sleep(check_interval)
+
+
+def set_precision(level: str = 'low'):
+    """
+    Set global precision for NumPy, PyTorch, and SimpleITK.
+
+    Parameters:
+        level (str): 'low' (default) for float32 or 'high' for float64.
+    """
+    import numpy as np
+    import torch
+    import SimpleITK as sitk
+
+    if level == 'high':
+        np_dtype = np.float64
+        torch_dtype = torch.float64
+        sitk_dtype = sitk.sitkFloat64
+        precision_msg = "Setting HIGH precision (float64)"
+    else:
+        np_dtype = np.float32
+        torch_dtype = torch.float32
+        sitk_dtype = sitk.sitkFloat32
+        precision_msg = "Setting LOW precision (float32) [Default]"
+
+    # NumPy
+    np.set_printoptions(precision=6, suppress=True)
+    np.seterr(all="ignore")
+
+    # PyTorch
+    torch.set_default_dtype(torch_dtype)
+    torch.backends.cudnn.benchmark = True  # Optimize for GPU
+
+    # SimpleITK
+    sitk.ProcessObject.SetGlobalDefaultCoordinateTolerance(1e-5)
+
+    logging.info(precision_msg)
 
 def configure_environment_variables():
     """
@@ -803,19 +886,20 @@ def dice_from_maps(fold_prob_maps: torch.Tensor) -> dict:
     fold_prob_maps_np = fold_prob_maps.cpu().numpy()  # (num_folds, num_classes, H, W, D)
 
     # Compute ensemble segmentation using mean probabilities + np.argmax (much faster in NumPy)
-    ensemble_segmentation = np.argmax(fold_prob_maps_np.mean(axis=0), axis=0)  # Shape: (H, W, D)
+    ensemble_segmentation = np.argmax(fold_prob_maps_np.mean(axis=0), axis=0).astype(np.uint16)  # Shape: (H, W, D)
 
     # Compute Dice scores for each fold
     class_scores = []
     overall_scores = []
     
     for i in range(fold_prob_maps_np.shape[0]):  # Loop over folds
-        fold_segmentation = np.argmax(fold_prob_maps_np[i], axis=0)  # (H, W, D)
+        fold_segmentation = np.argmax(fold_prob_maps_np[i], axis=0).astype(np.uint16)  # (H, W, D)
         scores = dice_score_per_class(fold_segmentation, ensemble_segmentation, fold_prob_maps_np.shape[1])
         logging.info(f"Dice Score fold {i}: {scores['overall']}")
         class_scores.append([scores[cls] for cls in range(fold_prob_maps_np.shape[1])])
         overall_scores.append(scores['overall'])
     
+
     # Compute mean Dice scores per class
     mean_dice_scores = {cls: np.mean([fold[cls] for fold in class_scores]) for cls in range(fold_prob_maps_np.shape[1])}
     mean_dice_scores['overall'] = np.mean(overall_scores)
@@ -823,6 +907,7 @@ def dice_from_maps(fold_prob_maps: torch.Tensor) -> dict:
     logging.info(f"Mean Dice Scores: {mean_dice_scores}")
 
     return mean_dice_scores
+
 
 def mean_dice_from_split(mean_dice_scores_list: list) -> dict:
     """
@@ -1312,7 +1397,9 @@ def run_multi_model_prediction(image_paths: List[str], models: List[dict], outpu
     dice_dict = mean_dice_from_split(dice_dicts) # Need to combine the dicts for multimodels..
     combined_segmentation = remove_small_components_multilabel(combined_segmentation, 250) # 125-500 Random threshold
     save_segmentation_result(output, image_base, model_base, combined_segmentation, label_names, multilabel, name=name, dice_dict=dice_dict)
-
+    
+    del combined_segmentation, dice_dict, processed_segments
+    gc.collect()
 
 def fill_mask_via_dilation(relabeled_mask, original_mask, max_iterations=15):
     logging.info('Starting the dilation process.')
@@ -1460,6 +1547,8 @@ def main():
     Main function to run the image processing pipeline.
     """
     global pool  # Allow signal handler to access the pool
+    set_precision('low')
+    
     try:
         # Set multiprocessing start method to 'spawn' for CUDA compatibility
         if get_device() == "cuda":
@@ -1495,6 +1584,10 @@ def main():
         logger = logging.getLogger()
         logging_level = logging.getLevelName(logger.getEffectiveLevel())
         logging.info(f"Current logging level: {logging_level}")
+
+        # Start memory monitor in a separate thread
+        monitor_thread = threading.Thread(target=memory_monitor, daemon=True)
+        monitor_thread.start()
 
         # Expand and sort images for multimodal pairing
         multimodal_images = []
